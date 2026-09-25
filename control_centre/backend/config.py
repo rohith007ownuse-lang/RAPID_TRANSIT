@@ -40,6 +40,7 @@ ENV_FLEETIQ_DB = "FLEETIQ_DB"
 
 # Deployment / exposure hardening
 ENV_ENVIRONMENT = "FLEETIQ_ENV"
+ENV_SAME_ORIGIN = "FLEETIQ_SAME_ORIGIN"
 ENV_CORS_ORIGINS = "FLEETIQ_CORS_ORIGINS"
 ENV_REQUIRE_AUTH_READS = "FLEETIQ_REQUIRE_AUTH_READS"
 ENV_ALLOW_INSECURE = "FLEETIQ_ALLOW_INSECURE_STARTUP"
@@ -56,6 +57,7 @@ DEFAULT_CABIN_INFERENCE_INTERVAL_SEC = 2.0
 DEFAULT_CABIN_DEFAULT_CAPACITY = 40
 DEFAULT_CAMERA_BUS_ID = "PROTO-001"
 DEFAULT_ENVIRONMENT = "development"
+DEFAULT_SAME_ORIGIN = True
 
 _TRUE_VALUES = ("1", "true", "yes", "on")
 
@@ -188,6 +190,7 @@ class SecurityConfig:
     environment: str = field(default_factory=lambda: (
         os.environ.get(ENV_ENVIRONMENT, DEFAULT_ENVIRONMENT).strip().lower() or DEFAULT_ENVIRONMENT
     ))
+    same_origin: bool = field(default_factory=lambda: _env_flag(ENV_SAME_ORIGIN, DEFAULT_SAME_ORIGIN))
     cors_origins: tuple = field(default_factory=lambda: _parse_origins(os.environ.get(ENV_CORS_ORIGINS)))
     require_auth_reads: bool = field(default_factory=lambda: _env_flag(ENV_REQUIRE_AUTH_READS))
     allow_insecure_startup: bool = field(default_factory=lambda: _env_flag(ENV_ALLOW_INSECURE))
@@ -204,14 +207,14 @@ class SecurityConfig:
         return self.is_production
 
     def cors_options(self) -> Optional[dict]:
-        """flask-cors options, or None to keep the permissive local default.
+        """flask-cors options, or None when no allowlist is configured.
 
-        With no allowlist configured, CORS is left at flask-cors' default
-        (all origins, no credentials) so local demos and LAN testing keep
-        working. In production an allowlist is mandatory, so this returns
-        explicit origins rather than '*'.
+        A same-origin deployment (the frontend and the API behind one nginx
+        host) needs no CORS at all, and gets none. When the frontend is hosted
+        separately, FLEETIQ_SAME_ORIGIN=0 plus an explicit origin allowlist is
+        mandatory in production — an empty list would serve wildcard CORS.
         """
-        if not self.cors_origins:
+        if self.same_origin or not self.cors_origins:
             return None
         return {
             "origins": list(self.cors_origins),
@@ -231,10 +234,10 @@ class SecurityConfig:
                 f"{ENV_ADMIN_PASSWORD} is unset or still the development default; "
                 "set a strong per-deployment password"
             )
-        if not self.cors_origins:
+        if not self.same_origin and not self.cors_origins:
             blockers.append(
-                f"{ENV_CORS_ORIGINS} is empty; set the exact frontend origin(s) "
-                "(comma-separated) so no wildcard CORS is served"
+                f"{ENV_SAME_ORIGIN}=0 requires {ENV_CORS_ORIGINS} to list the exact "
+                "frontend origin(s); an empty list would serve wildcard CORS"
             )
         return blockers
 

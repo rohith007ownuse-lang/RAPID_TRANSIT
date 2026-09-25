@@ -23,36 +23,57 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 // ---------------------------------------------------------------------------
 
 const WS_PORT = 8765
+const CAMERA_WS_PORT = 8766
 
 // Build a WebSocket URL that survives an HTTPS deployment.
 //
-// - VITE_WS_URL (set at build time) pins the API host explicitly, for the
-//   common split where the frontend is served by one host and the API by
-//   another. It may be absolute ("https://api.example.com") or a
-//   same-origin path ("/"); https/http are upgraded to wss/ws so the browser
-//   never blocks the socket as mixed content.
-// - Without it, the socket is derived from the page origin, so serving the
-//   SPA and the API behind one host (or an nginx proxy) needs no config.
-export function wsUrl(path = '/', port) {
-  const configured = (import.meta.env && import.meta.env.VITE_WS_URL) || ''
+// Three build-time modes, in priority order:
+// - VITE_WS_URL: absolute API host ("https://api.example.com") for a split
+//   deployment. http/https are upgraded to ws/wss so the browser never blocks
+//   the socket as mixed content.
+// - VITE_WS_PATH: same-origin path prefix, for a single-host deployment where
+//   nginx proxies the sockets on 443 (no public high ports to open).
+// - Neither: derive from the page hostname with the default ports, which is
+//   what `npm run dev` needs.
+function buildSocketUrl(path, port, env) {
+  const e = env || {}
   const origin = typeof window !== 'undefined' ? window.location.origin : 'http://127.0.0.1'
+  const configured = e.VITE_WS_URL || ''
+  const prefix = e.VITE_WS_PATH || ''
 
-  let url
   if (configured) {
-    url = new URL(configured, origin)
-  } else {
-    const secure = typeof window !== 'undefined' && window.location.protocol === 'https:'
-    url = new URL(`${secure ? 'wss' : 'ws'}://${typeof window !== 'undefined' ? window.location.host : '127.0.0.1'}${path}`)
+    const url = new URL(configured, origin)
+    url.protocol = url.protocol === 'https:' ? 'wss:' : url.protocol === 'http:' ? 'ws:' : url.protocol
     if (port) url.port = String(port)
+    const base = url.pathname.replace(/\/+$/, '')
+    url.pathname = `${base}${path}`
     return url.toString()
   }
 
-  url.protocol = url.protocol === 'https:' ? 'wss:' : url.protocol === 'http:' ? 'ws:' : url.protocol
-  if (port) url.port = String(port)
-  const base = url.pathname.replace(/\/+$/, '')
-  url.pathname = `${base}${path.startsWith('/') ? path : `/${path}`}`
-  return url.toString()
+  const secure = typeof window !== 'undefined' && window.location.protocol === 'https:'
+  const scheme = secure ? 'wss' : 'ws'
+
+  if (prefix) {
+    const base = prefix.replace(/\/+$/, '')
+    return `${scheme}://${typeof window !== 'undefined' ? window.location.host : '127.0.0.1'}${base}${path}`
+  }
+
+  // Dev fallback: the page is on the Vite port, the socket is on the backend
+  // port, so the port must be replaced rather than inherited.
+  const hostname = typeof window !== 'undefined' ? window.location.hostname : '127.0.0.1'
+  return `${scheme}://${hostname}${port ? `:${port}` : ''}${path}`
 }
+
+// Bus telemetry / alert socket (backend port 8765).
+export const busSocketUrl = () =>
+  buildSocketUrl('/', WS_PORT, typeof import.meta !== 'undefined' ? import.meta.env : undefined)
+
+// Camera frame socket (backend port 8766).
+export const cameraSocketUrl = () =>
+  buildSocketUrl('/camera', CAMERA_WS_PORT, typeof import.meta !== 'undefined' ? import.meta.env : undefined)
+
+// Exported for tests: resolve a socket URL against an explicit env.
+export { buildSocketUrl }
 
 const RECONNECT_BASE_DELAY = 1000  // 1 second
 const RECONNECT_MAX_DELAY = 30000  // 30 seconds
@@ -152,7 +173,7 @@ class FleetWebSocketClient {
     this._token = token
     this._setState(ConnectionState.CONNECTING)
 
-    const url = wsUrl('/', WS_PORT)
+    const url = busSocketUrl()
     try {
       this._ws = new WebSocket(url)
     } catch (err) {

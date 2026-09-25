@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { useMode } from '../lib/modeContext.jsx'
 import { useAuth } from '../lib/authContext.jsx'
 import { api } from '../api.js'
-import { wsUrl } from '../websocket.js'
+import { cameraSocketUrl } from '../websocket.js'
 
 /* ─── Metric Card ─── */
 function MetricCard({ label, value, unit, status, statusColor, barPct, showBar = true }) {
@@ -619,8 +619,7 @@ export function LiveCameraGrid() {
     const connectWs = () => {
       if (!alive) return
       
-      const wsUrlResolved = wsUrl('/', 8766)
-      ws = new WebSocket(wsUrlResolved)
+      ws = new WebSocket(cameraSocketUrl())
       wsRef.current = ws
 
       ws.onopen = () => {

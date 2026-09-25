@@ -33,11 +33,14 @@ from websocket_handler import start_websocket_server, stop_websocket_server
 # Create Flask app
 app = Flask(__name__)
 
-# CORS: permissive by default (local demo / LAN), restricted to an explicit
-# origin allowlist whenever FLEETIQ_CORS_ORIGINS is set (required in
-# production — see SecurityConfig.startup_blockers).
-_CORS_OPTIONS = get_config().security.cors_options()
-if _CORS_OPTIONS is None:
+# CORS: same-origin deployments (nginx serving the SPA and proxying the API)
+# get no CORS headers at all. A split deployment is restricted to an explicit
+# allowlist, which production requires — see SecurityConfig.startup_blockers.
+_SECURITY = get_config().security
+_CORS_OPTIONS = _SECURITY.cors_options()
+if _SECURITY.same_origin:
+    print("[control-centre] CORS: same-origin mode (no cross-origin access allowed)")
+elif _CORS_OPTIONS is None:
     CORS(app)
 else:
     CORS(app, resources={r"/api/*": _CORS_OPTIONS})
