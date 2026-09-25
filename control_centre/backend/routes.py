@@ -174,14 +174,33 @@ def auth_login():
     body = request.get_json(silent=True) or {}
     username = (body.get("username") or "").strip()
     password = body.get("password") or ""
+    ip = auth.client_ip(request)
+    ua = request.headers.get("User-Agent", "")
     user = auth.authenticate(username, password)
     if user is None:
+        auth.log_access(username, False, ip, ua)
         return jsonify({"error": "invalid username or password"}), 401
-    token, expires_at = auth.create_session(user["id"])
+    token, expires_at = auth.create_session(user["id"], ip=ip, user_agent=ua)
+    auth.log_access(username, True, ip, ua)
     return jsonify({
         "token": token,
         "expires_at": expires_at,
         "user": auth.user_payload(user),
+    })
+
+
+@api.route("/api/auth/access", methods=["GET"])
+@_require_auth("admin")
+def auth_access():
+    """Owner view: who has been opening this deployment, and who is on now.
+
+    `log` = newest-first login attempts (user, time, success, IP, browser).
+    `active_sessions` = unexpired logins with their login origin.
+    Admin-only: this is exactly the information an attacker would want.
+    """
+    return jsonify({
+        "log": auth.get_access_log(limit=request.args.get("limit", 100)),
+        "active_sessions": auth.get_active_sessions(),
     })
 
 

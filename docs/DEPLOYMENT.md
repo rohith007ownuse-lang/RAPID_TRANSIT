@@ -67,3 +67,22 @@ for the whole demo. Use it when a server is not ready yet.
 4. Open the URL on your own phone once and walk one full flow
    (dashboard → fleet → bus detail → incidents).
 5. Keep laptop plugged in, sleep disabled, if you are on Option B.
+
+## Watching access and killing the URL (tunnel demo)
+
+**Who opened it:** every login attempt is recorded with time, username,
+success/failure, IP and browser. As admin:
+
+```bash
+curl -s -H "Authorization: Bearer <your-token>" https://<your-url>/api/auth/access \
+  | python3 -m json.tool
+```
+
+`log` is the newest-first attempt history; `active_sessions` is who holds a
+live login right now and where they logged in from.
+
+**Stop it any time:** `./deploy/stop-demo.sh` kills the tunnel, the preview
+and the backend. The public URL dies instantly and permanently — quick-tunnel
+addresses are single-use and can never come back. Nothing is deleted: users
+and the demo database survive, and re-running `tunnel-demo.sh` mints a brand-
+new URL.

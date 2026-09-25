@@ -114,6 +114,21 @@ CREATE TABLE IF NOT EXISTS road_risk_zones (
 );
 """
 
+# Access audit: who tried to log in, when, from where, and whether it worked.
+# Written on every /api/auth/login attempt; read by admins via
+# GET /api/auth/access. Capped so a brute-force storm cannot grow the DB.
+_SCHEMA_ACCESS_LOG = """
+CREATE TABLE IF NOT EXISTS access_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    at           TEXT NOT NULL,
+    username     TEXT NOT NULL,
+    success      INTEGER NOT NULL DEFAULT 0,
+    ip           TEXT NOT NULL DEFAULT '',
+    user_agent   TEXT NOT NULL DEFAULT ''
+);
+"""
+ACCESS_LOG_CAP = 5000
+
 
 def default_db_path():
     return Path(__file__).resolve().parent / "data" / "control_centre.db"
@@ -137,6 +152,7 @@ def init_db(path=None, force=False):
             conn.execute(_SCHEMA_SESSIONS)
             conn.execute(_SCHEMA_ROAD_CLUSTERS)
             conn.execute(_SCHEMA_ROAD_RISK_ZONES)
+            conn.execute(_SCHEMA_ACCESS_LOG)
             conn.commit()
         finally:
             conn.close()

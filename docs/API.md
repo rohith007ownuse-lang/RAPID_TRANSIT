@@ -13,6 +13,7 @@ Base: same origin as the UI. In local dev the Vite proxy forwards `/api` to
 | `/api/auth/me/password` | POST | token | change own password |
 | `/api/auth/users` | GET/POST | admin | list / create users |
 | `/api/auth/users/<id>/role\|active\|password` | POST | admin | manage users (last active admin is guarded) |
+| `/api/auth/access` | GET | admin | owner view: newest-first login attempts (user, time, success, IP, browser) plus currently active sessions with login origin |
 
 Send `Authorization: Bearer <token>`. Roles: `operator` < `supervisor` < `admin`.
 

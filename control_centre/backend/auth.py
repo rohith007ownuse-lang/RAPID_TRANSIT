@@ -241,21 +241,36 @@ def update_password(user_id: int, new_password: str) -> bool:
 # Sessions (server-side bearer tokens)
 # ---------------------------------------------------------------------------
 
-def create_session(user_id: int) -> tuple[str, float]:
-    """Issue an opaque bearer token for a user. Returns (token, expires_at)."""
+def create_session(user_id: int, ip: str = "", user_agent: str = "") -> tuple[str, float]:
+    """Issue an opaque bearer token for a user. Returns (token, expires_at).
+
+    The login IP / user agent are stored with the session (columns added
+    lazily, so databases created before this feature keep working) — that is
+    what powers the "who is on right now" view for demo owners.
+    """
     token = secrets.token_urlsafe(_TOKEN_BYTES)
     expires_at = time.time() + _session_ttl_hours() * 3600.0
     conn = persistence._conn()
     try:
+        _ensure_session_origin_columns(conn)
         conn.execute(
-            "INSERT INTO sessions (token, user_id, created_at, expires_at)"
-            " VALUES (?, ?, ?, ?)",
-            (token, user_id, _now_iso(), expires_at),
+            "INSERT INTO sessions (token, user_id, created_at, expires_at, ip, user_agent)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (token, user_id, _now_iso(), expires_at, ip or "", (user_agent or "")[:300]),
         )
         conn.commit()
     finally:
         conn.close()
     return token, expires_at
+
+
+def _ensure_session_origin_columns(conn) -> None:
+    """Add ip/user_agent to sessions on older databases (no-op if present)."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)")}
+    if "ip" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN ip TEXT NOT NULL DEFAULT ''")
+    if "user_agent" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN user_agent TEXT NOT NULL DEFAULT ''")
 
 
 def get_user_by_token(token: str) -> dict | None:
@@ -374,3 +389,86 @@ def user_payload(user: dict) -> dict:
         "created_at": user["created_at"],
         "updated_at": user["updated_at"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Access audit — who is opening the demo, and from where
+# ---------------------------------------------------------------------------
+
+def client_ip(req) -> str:
+    """Best-effort visitor IP behind proxies and the Cloudflare tunnel.
+
+    Cloudflare's edge stamps CF-Connecting-IP on every request; otherwise the
+    leftmost X-Forwarded-For entry wins; otherwise the direct peer. Behind the
+    tunnel that peer is always 127.0.0.1, so the headers are what matter.
+    """
+    cf = (req.headers.get("CF-Connecting-IP") or "").strip()
+    if cf:
+        return cf
+    fwd = (req.headers.get("X-Forwarded-For") or "").strip()
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return (getattr(req, "remote_addr", "") or "").strip()
+
+
+def log_access(username: str, success: bool, ip: str = "", user_agent: str = "") -> None:
+    """Record one login attempt. Never raises — auditing must not break login."""
+    try:
+        conn = persistence._conn()
+        try:
+            conn.execute(
+                "INSERT INTO access_log (at, username, success, ip, user_agent)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (_now_iso(), (username or "-")[:64], 1 if success else 0,
+                 (ip or "")[:64], (user_agent or "")[:300]),
+            )
+            conn.execute(
+                "DELETE FROM access_log WHERE id <= "
+                "(SELECT MAX(id) - ? FROM access_log)",
+                (persistence.ACCESS_LOG_CAP,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def get_access_log(limit: int = 100) -> list[dict]:
+    """Newest-first login attempts for the owner's access view (admin only)."""
+    try:
+        limit = max(1, min(int(limit), 500))
+    except (TypeError, ValueError):
+        limit = 100
+    conn = persistence._conn()
+    try:
+        rows = conn.execute(
+            "SELECT at, username, success, ip, user_agent FROM access_log"
+            " ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_active_sessions() -> list[dict]:
+    """Non-expired sessions with their login origin — 'who is on right now'.
+
+    Expired rows are swept on read so the table cannot grow unbounded.
+    """
+    now = time.time()
+    conn = persistence._conn()
+    try:
+        _ensure_session_origin_columns(conn)
+        conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
+        conn.commit()
+        rows = conn.execute(
+            "SELECT s.created_at AS login_at, s.expires_at, s.ip, s.user_agent,"
+            " u.username, u.role FROM sessions s"
+            " JOIN users u ON u.id = s.user_id"
+            " WHERE u.active = 1 ORDER BY s.created_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
