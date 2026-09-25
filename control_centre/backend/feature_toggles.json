@@ -16,7 +16,7 @@
   "audio_alerts": true,
   "crash_detection": true,
   "overload_alert": true,
-  "ws_alerts": true,
+  "ws_alerts": false,
   "intercom": true,
   "bus_node_ws": true,
   "fleet_sim": true,

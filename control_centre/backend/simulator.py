@@ -1360,14 +1360,16 @@ class FleetSimulator:
             reg_no = f"TN-01-{zone}-{reg_base + created:04d}"
 
             first_stop = route["stops"][0]
+            journey = self._fresh_journey(route)
+            lat, lon, speed = self._scatter_start(rng, journey)
             bus = {
                 "bus_id": bus_name,          # "19D" / "19D .2"
                 "reg_no": reg_no,            # "TN-01-F-0234"
                 "route_code": route["code"],  # "19D"
                 "route": route["name"],      # "19D - Thambaram to Beach"
-                "latitude": first_stop["lat"] + rng.uniform(-0.002, 0.002),
-                "longitude": first_stop["lon"] + rng.uniform(-0.002, 0.002),
-                "speed_kmh": 0.0,
+                "latitude": lat,
+                "longitude": lon,
+                "speed_kmh": speed,
                 "vehicle_type": "EV" if route["ev"] else "DIESEL",
                 "driver": {"state": "NORMAL", "name": self.DRIVER_NAMES[created % len(self.DRIVER_NAMES)],
                            "ear": 0.30, "mar": 0.35,
@@ -1383,7 +1385,7 @@ class FleetSimulator:
                             "vibration": rng.uniform(0.1, 0.5),
                             "braking_events": 0, "maintenance_priority": "LOW",
                             "type": "EV" if route["ev"] else "DIESEL"},
-                "journey": self._fresh_journey(route),
+                "journey": journey,
                 "ticketing": self._fresh_ticketing(rng),
                 "last_update": utcnow_iso(),
                 "simulation": True,
@@ -1435,6 +1437,57 @@ class FleetSimulator:
         bus["boarding_by_stop_hour"] = by_stop_hour
         bus["daily_boarding_total"] = total
         bus["boarding_peak_hour"] = peak_hour
+
+    def _scatter_start(self, rng, journey):
+        """Spread buses along the route at startup instead of stacking them.
+
+        Every bus used to begin at its route's first stop (progress 0), so all
+        ~30 buses on a route opened the map piled on one marker — and because
+        every bus advances at the same KM_PER_MIN pace, the pile moved as one
+        convoy. Now each bus starts mid-service-day: parked at a random stop
+        or moving mid-leg, in either direction, with a matching position and
+        speed so the first paint already looks like a live fleet.
+        """
+        total = journey["total_stops"]
+        last = max(0, total - 1)
+        if rng.random() < 0.35 or last == 0:
+            # Parked at a random stop (terminals included).
+            stop_idx = rng.randrange(total)
+            journey["current_index"] = stop_idx
+            journey["next_index"] = min(stop_idx + 1, last)
+            journey["state"] = "AT_STOP"
+            journey["progress"] = 0.0
+            journey["layover_ticks"] = 0
+            s = journey["stops"][stop_idx]
+            lat, lon = s["lat"], s["lon"]
+            speed = 0.0
+        else:
+            # Moving mid-leg on a random segment, either direction.
+            seg = rng.randrange(max(1, last))
+            frac = rng.random()
+            if rng.random() < 0.4 and seg > 0:
+                journey["direction"] = -1
+                journey["current_index"] = seg
+                journey["next_index"] = seg - 1
+                journey["origin"] = journey["stops"][-1]["stop"]
+                journey["destination"] = journey["stops"][0]["stop"]
+                journey["start"] = journey["origin"]
+            else:
+                journey["current_index"] = seg
+                journey["next_index"] = seg + 1
+            journey["state"] = "MOVING"
+            journey["progress"] = frac
+            journey["layover_ticks"] = 0
+            a = journey["stops"][journey["current_index"]]
+            b = journey["stops"][journey["next_index"]]
+            lat = a["lat"] + (b["lat"] - a["lat"]) * frac
+            lon = a["lon"] + (b["lon"] - a["lon"]) * frac
+            speed = round(rng.uniform(28, 46), 1)
+        # Small GPS-style scatter so markers sharing a stop don't sit exactly
+        # on top of each other.
+        lat += rng.uniform(-0.001, 0.001)
+        lon += rng.uniform(-0.001, 0.001)
+        return round(lat, 6), round(lon, 6), speed
 
     def _fresh_journey(self, route):
         """Describe the stop-by-stop journey for this route.
