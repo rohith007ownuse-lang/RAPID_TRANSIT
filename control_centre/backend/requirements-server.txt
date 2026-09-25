@@ -1,0 +1,10 @@
+# Minimal server runtime: everything the control centre needs in simulation
+# mode on a headless box (no cameras, no local ML inference).
+#
+# The vision stack (opencv / ultralytics / mediapipe) stays in
+# requirements.txt for local development only — every heavy import in the
+# codebase is lazy, so the server boots and serves without it. This split is
+# what makes ARM cloud VMs (e.g. Oracle Ampere A1) work out of the box.
+flask>=3.0
+flask-cors>=4.0
+websockets>=14.0
