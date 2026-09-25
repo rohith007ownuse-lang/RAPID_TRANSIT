@@ -22,7 +22,9 @@ session_summary_*.txt
 
 # Models (large binaries; re-downloadable)
 bus_node/models/face_landmarker.task
-bus_node/src/yolov8n.pt
+# NOTE: bus_node/src/yolov8n.pt is intentionally TRACKED — the cabin person
+# detector resolves it as its in-repo default and tests assert it exists, so a
+# fresh clone must contain it.
 
 # Runtime databases
 *.db
