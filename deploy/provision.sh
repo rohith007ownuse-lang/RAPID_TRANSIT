@@ -50,23 +50,27 @@ npm ci --no-audit --no-fund
 VITE_WS_PATH=/ws npm run build
 
 echo "==> Installing backend dependencies"
-cd "$APP_DIR/backend"
-python3 -m venv venv
-./venv/bin/pip install --quiet --upgrade pip
-./venv/bin/pip install --quiet -r requirements.txt
+# The venv lives at the app root (the systemd unit points at it) and the
+# backend package keeps its repo-relative layout under control_centre/.
+python3 -m venv "$APP_DIR/venv"
+"$APP_DIR/venv/bin/pip" install --quiet --upgrade pip
+"$APP_DIR/venv/bin/pip" install --quiet -r "$APP_DIR/control_centre/backend/requirements.txt"
 
 # The trained models are large binaries that rsync already copied; confirm the
 # app can actually import before the service is enabled.
-./venv/bin/python -c "import server" 2>/dev/null || true
+(cd "$APP_DIR/control_centre/backend" && "$APP_DIR/venv/bin/python" -c "import server") \
+    || { echo "Backend failed to import — check requirements and model files." >&2; exit 1; }
 
 install -m 0644 "$APP_DIR/deploy/systemd/fleetiq.service" /etc/systemd/system/fleetiq.service
 install -m 0644 "$APP_DIR/deploy/nginx/fleetiq.conf" /etc/nginx/sites-available/fleetiq
 ln -sf /etc/nginx/sites-available/fleetiq /etc/nginx/sites-enabled/fleetiq
 rm -f /etc/nginx/sites-enabled/default
 
+mkdir -p /etc/fleetiq
 if [ ! -f /etc/fleetiq/fleetiq.env ]; then
-    echo "!! /etc/fleetiq/fleetiq.env is missing."
-    echo "!! Create it before starting (see deploy/fleetiq.env.example)."
+    install -m 0640 "$APP_DIR/deploy/fleetiq.env.example" /etc/fleetiq/fleetiq.env
+    echo "!! Created /etc/fleetiq/fleetiq.env from the example."
+    echo "!! Set FLEETIQ_ADMIN_PASSWORD in it, then re-run this script."
     exit 1
 fi
 chmod 0640 /etc/fleetiq/fleetiq.env
@@ -74,15 +78,25 @@ chown root:"$SERVICE_USER" /etc/fleetiq/fleetiq.env
 
 chown -R "$SERVICE_USER":"$SERVICE_USER" "$APP_DIR"
 
+# Validate nginx before touching the running service, so a bad config never
+# takes the site down.
+nginx -t
 systemctl daemon-reload
 systemctl enable --now fleetiq
-nginx -t
 systemctl reload nginx
 
-echo "==> Done. Next steps on the server:"
+sleep 3
+if ! curl -fsS --max-time 5 http://127.0.0.1:5001/api/health >/dev/null; then
+    echo "!! The service started but /api/health is not answering." >&2
+    echo "!! Check: journalctl -u fleetiq -n 50" >&2
+    exit 1
+fi
+
+echo "==> Done. The control centre is live on http://$(hostname -I | awk '{print $1}')/"
+echo "==> Next steps on the server:"
 echo "    systemctl status fleetiq"
 echo "    journalctl -u fleetiq -f"
-echo "    certbot --nginx -d <your-domain>"
+echo "    certbot --nginx -d <your-domain>    # only if you have a domain"
 REMOTE
 
 echo

@@ -319,3 +319,97 @@ PYTHONUNBUFFERED=1 setsid venv/bin/python server.py --start-mode live \
 - Verified: real fire image → `fire` conf 0.452, CRITICAL CABIN_FIRE event on
   2nd frame; non-fire image → 0 detections; 739/739 tests pass; backend +
   frontend rebuilt and healthy.
+
+---
+
+# SESSION CHANGELOG — Sep 25, 2026 (Phases 16–19 + public deployment)
+
+Gap-closure roadmap Phases 16–19 (operational intelligence, historical
+analytics, real-time reliability, system resilience), then the security and
+deployment work needed to show the UI to SIH judges over the internet.
+804/804 backend tests, 6/6 frontend WebSocket tests, frontend builds green.
+
+## Phase 16 — Incident intelligence, correlation & response ✅
+- `backend/incident_intelligence.py`: raw events are correlated into
+  trackable `Incident`s (`Incident`, `IncidentStore`) with severity, category,
+  priority, evidence, data-source labelling, duty-roster auto-assignment and
+  timeout re-routing. Never fabricates: an incident exists only from real
+  events.
+- Lifecycle: `acknowledge` → `investigate` → `resolve` → `close`, each recorded.
+- Routes: `/api/incidents`, `/api/incidents/active`, `/api/incidents/summary`,
+  `/api/incidents/<id>` plus the four lifecycle actions, and
+  `/api/buses/<id>/incidents`. `Incidents.jsx` renders the operational queue.
+- 75 tests in `tests/test_phase16_incident_intelligence.py`.
+
+## Phase 17 — Analytics & historical intelligence ✅
+- `backend/analytics_intelligence.py`: event, incident, risk, ETA, load, road,
+  driver-safety, route and per-bus analytics over a time range, with trends and
+  time bucketing. Every metric is computed from persisted records and labelled
+  with its data source; missing history is reported as unavailable, never
+  interpolated into a fake trend.
+- Routes: `/api/analytics/operations`, `/api/analytics`,
+  `/api/analytics/incidents-drilldown`. `HistoricalIntelligence.jsx`
+  (`/historical`) is the operator view.
+- 75 tests in `tests/test_phase17_analytics_intelligence.py`.
+
+## Phase 18 — WebSocket reliability hardening ✅
+- `backend/websocket_hardening.py`: `ConnectionState` lifecycle,
+  exponential-backoff reconnection, message deduplication, event coalescing,
+  priority queueing, message validation (`validate_message`), server connection
+  tracking, state resynchronisation, and `preserve_data_source()` so a
+  reconnect can never silently turn a live bus into a simulated one.
+- 80 tests in `tests/test_phase18_websocket_hardening.py`.
+
+## Phase 19 — System health, failure detection & degraded modes ✅
+- `backend/system_health.py`: `HealthState` (HEALTHY / DEGRADED / DISCONNECTED /
+  STARTING / STOPPING / FAILED / RECOVERING / UNKNOWN) and `DataFreshness`
+  (FRESH / STALE / UNAVAILABLE / UNKNOWN) per subsystem, with
+  `record_subsystem_success/failure`, `get_system_health()`,
+  `get_overall_health()`. A missing subsystem is never shown as healthy.
+- Routes: `/api/system/health`, `/api/system/health/<subsystem>`; operator
+  panel in `components/SystemHealth.jsx`.
+- 35 tests in `tests/test_phase19_system_health.py`.
+
+## Deployment security ✅
+- `FLEETIQ_ENV=production` makes every read endpoint authenticated (only
+  `/api/health` and `/api/auth/login` stay open) and turns startup warnings
+  into hard failures: no default admin password, no cross-origin allowlist.
+- `FLEETIQ_SAME_ORIGIN=1` allows same-origin-only browser access, so a
+  single-host deployment needs no CORS allowlist at all.
+- Camera REST endpoints and the camera WebSocket require a token (sent in the
+  camera socket's subscribe payload).
+- Socket URL resolution: `VITE_WS_URL` → `VITE_WS_PATH` → dev-port fallback,
+  covered by 6 frontend tests.
+
+## Public demo deployment ✅
+- `deploy/provision.sh` + `deploy/systemd/fleetiq.service` +
+  `deploy/nginx/fleetiq.conf`: single-host deployment on a free VPS. nginx
+  serves the SPA and proxies `/api`, `/ws` and `/ws/camera`, so only port 80/443
+  is exposed. `certbot --nginx -d <domain>` adds HTTPS afterwards; without a
+  domain the site works on `http://<server-ip>/`.
+- `deploy/tunnel-demo.sh`: no-server fallback. Starts the backend (simulation,
+  isolated demo database), `vite preview` (same-origin `/api` + `/ws` proxy) and
+  a Cloudflare quick tunnel, then prints the public `trycloudflare.com` URL.
+
+## Fixes found while deploying ✅
+- `server.py` called `persistence.init_db()` with no argument, so `FLEETIQ_DB`
+  was silently ignored and the app always opened the bundled
+  `data/control_centre.db`. Deployments would have written to a read-only code
+  tree. Now honours `FLEETIQ_DB` and falls back to the bundled dev database.
+- `deploy/*` referenced `/opt/fleetiq/backend` and `/opt/fleetiq/frontend`,
+  but the repo layout is `control_centre/backend` and
+  `control_centre/frontend`. Paths corrected in the unit, nginx site and
+  provisioning script.
+- The nginx site shipped an `ssl_certificate`-less `listen 443 ssl` block plus
+  an HTTP→HTTPS redirect, which cannot pass `nginx -t` on a fresh server and
+  blocks `certbot`. The site is now HTTP-first; certbot adds TLS.
+- `vite.config.js` now shares one proxy definition between `vite dev` and
+  `vite preview`, so the tunnel demo serves the SPA, the API and both
+  WebSockets on a single origin exactly like nginx does.
+
+## Verified ✅
+- 804/804 backend tests, frontend build green, 6/6 WebSocket URL tests.
+- Public tunnel end to end: SPA 200, deep link 200, `/api/health` ok
+  (simulation), unauthenticated read 401, admin login issues a token,
+  authenticated read 200, and the bus WebSocket completes a real handshake
+  through the public HTTPS URL.

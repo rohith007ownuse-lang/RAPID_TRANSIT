@@ -25,7 +25,7 @@ from flask_cors import CORS
 import auth
 import persistence
 from data_store import store, mode_state
-from config import get_config
+from config import get_config, get_db_path
 from lifecycle import get_lifecycle
 from simulator import FleetSimulator
 from websocket_handler import start_websocket_server, stop_websocket_server
@@ -738,7 +738,9 @@ def _start_demo_incident_rotation():
 
 def _load_persisted_history():
     """Re-hydrate the in-memory event log from SQLite at startup."""
-    persistence.init_db()
+    # Honour FLEETIQ_DB when set (deployments point it at a writable, persistent
+    # path outside the code tree); fall back to the bundled dev database.
+    persistence.init_db(get_db_path())
     loaded = persistence.load_events()
     # Bulk-load into memory WITHOUT re-persisting: the rows are already the
     # source of truth and re-writing all of them through add_event() is an
