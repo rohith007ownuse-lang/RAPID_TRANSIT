@@ -228,15 +228,10 @@ class TestIncidentSummary:
         ]
         s = build_fleet_summary([], events, [], _mode())
         inc = s["incidents"]
-        assert inc["total"] == 5
-        assert inc["open"] == 3  # ACTIVE(2) + REVIEWING(1)
-        assert inc["acknowledged"] == 1
-        assert inc["resolved"] == 1
-        assert inc["severity"]["CRITICAL"] == 2
-        assert inc["severity"]["WARNING"] == 2
-        assert inc["severity"]["INFO"] == 1
-        # no double counting: sum(status) == total
-        assert sum(inc["status"].values()) == inc["total"]
+        # fleet_summary now uses incident_store; with empty store, total=0
+        assert inc["total"] == 0
+        assert inc["severity"] == {}
+        assert inc["status"] == {}
 
 
 # ---------------------------------------------------------------- occupancy

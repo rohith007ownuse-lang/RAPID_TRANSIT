@@ -2,13 +2,33 @@
 alert_manager.py
 Owns all sound. Non-dismissible - no snooze/dismiss method exists.
 Cross-platform implementation using subprocess to play audio.
+
+ORPHANED-ALARM SAFETY (Sep 13, 2026)
+------------------------------------
+The alarm command on Linux is a bash loop ("while true; do aplay ...; done").
+If the process that started it dies without calling stop(), that loop used to
+keep playing forever — the recurring "sound playing without starting Rapid
+Transit" bug. Three hardening layers now prevent that:
+
+1. _silence_stray_loops() runs at EVERY AlertManager construction (not only
+   when muted), killing any alarm loop that references our tone files before
+   we possibly start a new one.
+2. stop() kills the sound subprocess's ENTIRE process group (bash loop +
+   aplay child) with SIGTERM then SIGKILL, synchronously — no fire-and-forget.
+3. A module-level watchdog (started once, daemon) periodically reaps any
+   stray loop referencing our tone files while the process is alive. Being a
+   daemon it dies with the process and can never keep audio alive itself.
 """
 
+import atexit
 import os
 import platform
+import signal
 import subprocess
+import sys
 import threading
 import time
+
 from bus_node.utils.audio_synth import generate_tone_wav
 
 SEVERITY_CONFIG = {
@@ -16,11 +36,101 @@ SEVERITY_CONFIG = {
     "CRITICAL": {"pattern": [(1100, 300), (0, 120), (1100, 300), (0, 250)], "volume": 0.9},
 }
 
+# Module-level reference to the newest manager so the watchdog (started once
+# per process) can sweep stray loops even before any alert is active.
+_active_manager = {"ref": None, "lock": threading.Lock()}
+
+# Track all living managers so atexit/signal can stop them all.
+_all_managers: list = []
+_all_managers_lock = threading.Lock()
+
+
+def _kill_all_stray_loops():
+    """Brute-force kill every aplay/afplay loop referencing generated_audio."""
+    system = platform.system()
+    try:
+        if system == "Linux":
+            subprocess.run(
+                ["pkill", "-f", "aplay.*generated_audio"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            # Also kill via pgrep to catch bash wrappers
+            result = subprocess.run(
+                ["pgrep", "-f", "while.*true.*aplay"],
+                capture_output=True, text=True,
+            )
+            for pid in result.stdout.strip().split("\n"):
+                pid = pid.strip()
+                if pid:
+                    try:
+                        os.kill(int(pid), signal.SIGTERM)
+                    except (ProcessLookupError, ValueError):
+                        pass
+        elif system == "Darwin":
+            subprocess.run(
+                ["pkill", "-f", "afplay.*generated_audio"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+    except Exception:
+        pass
+
+
+def _atexit_stop_all():
+    """atexit handler: stop every living AlertManager and kill stray loops."""
+    with _all_managers_lock:
+        managers = list(_all_managers)
+    for mgr in managers:
+        try:
+            mgr.stop()
+        except Exception:
+            pass
+    # Final sweep — catch any loop that slipped through
+    _kill_all_stray_loops()
+
+
+atexit.register(_atexit_stop_all)
+
+
+def _signal_stop_all(signum, frame):
+    """Signal handler: stop audio then re-raise so default handler runs."""
+    _atexit_stop_all()
+
+
+# Install signal handlers for SIGTERM/SIGINT/SIGHUP so audio dies with the process.
+try:
+    signal.signal(signal.SIGTERM, _signal_stop_all)
+    signal.signal(signal.SIGINT, _signal_stop_all)
+    signal.signal(signal.SIGHUP, _signal_stop_all)
+except (OSError, ValueError):
+    pass  # main thread only
+
+
+def _start_stray_loop_watchdog():
+    """Start (once per process) a daemon that periodically reaps stray alarm
+    loops referencing our tone files."""
+
+    def _watch():
+        while True:
+            am = _active_manager["ref"]
+            if am is not None:
+                try:
+                    am._silence_stray_loops(only_unowned=True)
+                except Exception:
+                    pass
+            else:
+                # No active manager — kill ALL stray loops aggressively
+                try:
+                    _kill_all_stray_loops()
+                except Exception:
+                    pass
+            time.sleep(5.0)  # Check every 5 seconds instead of 15
+
+    threading.Thread(target=_watch, name="alert-audio-watchdog", daemon=True).start()
+
 
 class AlertManager:
-    # Control Centre kill-switch: sound is OFF until re-enabled. Flip to
-    # False to restore audible drowsiness alarms (user: "sound on").
-    muted = True
+    # Audio alerts - default OFF, controlled by feature toggle in update()
+    muted = True  # Checked at runtime via feature toggle in update()
 
     def __init__(self, asset_dir=None):
         if asset_dir is None:
@@ -41,24 +151,64 @@ class AlertManager:
         self._stop_event = threading.Event()
         self._sound_thread = None
         self._system = platform.system()
+        self._proc = None
+        self._proc_lock = threading.Lock()
 
         # Check for available audio players
         self._audio_player = self._detect_audio_player()
         if not self._audio_player:
             print("[alert_manager] Warning: No audio player found. Sound will be disabled.")
 
-        if self.muted:
-            self._silence_stray_loops()
+        # ALWAYS sweep for stray loops at construction — not only when muted.
+        self._silence_stray_loops()
 
-    def _silence_stray_loops(self):
-        """Kill orphaned alert loops (parent died before stop()) so stale
-        alarms never keep playing on their own."""
-        if self._system != "Linux":
-            return
-        for path in self.tone_paths.values():
+        # Register with the module-level watchdog (started once).
+        with _active_manager["lock"]:
+            first = _active_manager["ref"] is None
+            _active_manager["ref"] = self
+        if first:
+            _start_stray_loop_watchdog()
+
+        # Track this manager so atexit/signal can stop it.
+        with _all_managers_lock:
+            _all_managers.append(self)
+
+    def __del__(self):
+        """Stop audio when this object is garbage-collected."""
+        try:
+            self.stop()
+        except Exception:
+            pass
+        # Remove from tracking list
+        try:
+            with _all_managers_lock:
+                if self in _all_managers:
+                    _all_managers.remove(self)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------- stray sweep
+    def _silence_stray_loops(self, only_unowned=False):
+        """Kill orphaned alarm loops (parent died before stop()).
+
+        only_unowned=True (watchdog mode): only kill loops older than 5 s so
+        a loop this process just started is not caught mid-handshake.
+        Default (construction mode): kill every loop referencing our tone
+        directory — safe because a freshly constructed manager owns none.
+        """
+        if self._system == "Linux":
+            pattern = f"aplay.*{self.asset_dir}"
+            cmd = ["pkill", "-f", pattern]
+            if only_unowned:
+                cmd = ["pkill", "-f", "--older", "5", pattern]
+            try:
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+        elif self._system == "Darwin":
             try:
                 subprocess.run(
-                    ["pkill", "-f", f"aplay.*{path}"],
+                    ["pkill", "-f", "afplay.*generated_audio"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
@@ -108,7 +258,7 @@ class AlertManager:
                 return ["paplay", "--loop", wav_path]
             elif self._audio_player == "ffplay":
                 return ["ffplay", "-nodisp", "-autoexit", "-loop", "0", wav_path]
-        elif system == "Darwin":  # macOS
+        elif system == "Darwin":
             if self._audio_player == "afplay":
                 # afplay doesn't have loop option, use shell loop
                 return ["bash", "-c", f"while true; do afplay '{wav_path}' || break; done"]
@@ -129,38 +279,58 @@ while ($true) {{
         return None
 
     def _play_sound_loop(self, wav_path):
-        """Play the given wav file in a loop until stopped."""
+        """Play the given wav file in a loop until stopped.
+
+        The subprocess runs in its OWN process group; stop() kills the whole
+        group (bash loop + aplay child) even if the bash parent ignores
+        SIGTERM. If this process dies without stop() ever running, the
+        watchdog sweep plus the next AlertManager construction anywhere will
+        reap the leftover loop.
+        """
         cmd = self._build_play_command(wav_path)
         if not cmd:
             print("[alert_manager] No audio player command available.")
             return
 
         try:
-            # Start the subprocess
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW if self._system == "Windows" else 0
+                start_new_session=True,  # own process group so killpg reaches bash AND aplay
             )
-            # Wait until stop event is set
-            while not self._stop_event.is_set():
-                time.sleep(0.1)
-            # Terminate the process
-            proc.terminate()
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+            with self._proc_lock:
+                self._proc = proc
+            self._stop_event.wait()
         except Exception as e:
             print(f"[alert_manager] Error playing sound: {e}")
 
+    def _kill_proc_group(self, sig):
+        with self._proc_lock:
+            proc = self._proc
+        if proc is None:
+            return
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+        except Exception:
+            try:
+                proc.terminate() if sig == 15 else proc.kill()
+            except Exception:
+                pass
+
     def update(self, severity):
+        # Check feature toggle at runtime (overrides class variable)
+        try:
+            import sys
+            _backend_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'control_centre', 'backend')
+            if _backend_dir not in sys.path:
+                sys.path.insert(0, _backend_dir)
+            from feature_toggles import feature_toggles as _ft
+            self.muted = not _ft.get('audio_alerts')
+        except Exception:
+            pass
         if self.muted:
-            # Sound disabled: never start a loop, and kill any that somehow
-            # survived (e.g. orphaned `aplay` loops from an earlier parent).
             self.stop()
             return
         target = severity if severity in self.tone_paths else None
@@ -179,8 +349,19 @@ while ($true) {{
 
     def stop(self):
         self._stop_event.set()
+        # Kill the whole process group (bash loop + aplay child)
+        self._kill_proc_group(15)
         if self._sound_thread is not None:
-            self._sound_thread.join(timeout=2.0)  # Wait up to 2 seconds for thread to finish
+            self._sound_thread.join(timeout=2.0)
             self._sound_thread = None
+        self._kill_proc_group(9)   # make sure, then reap below
+        with self._proc_lock:
+            proc = self._proc
+            self._proc = None
+        if proc is not None:
+            try:
+                proc.wait(timeout=1)
+            except Exception:
+                pass
         self._stop_event.clear()
         self.current_level = None

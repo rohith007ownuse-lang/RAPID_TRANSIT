@@ -31,10 +31,18 @@ cv2_mock = MagicMock()
 sys.modules.setdefault("cv2", cv2_mock)
 
 import server  # noqa: E402
+import lifecycle  # noqa: E402
+from lifecycle import get_lifecycle  # noqa: E402
 from ai.camera_manager import CameraManager, SLOT_DRIVER, SLOT_CABIN, SLOT_ROAD  # noqa: E402
 from ai.driver.driver_drowsiness import DriverDrowsinessDetector  # noqa: E402
 from data_store import store  # noqa: E402
 from websocket_handler import adapt_bus_state, stop_websocket_server  # noqa: E402
+
+
+def _reset_lifecycle():
+    """Replace the lifecycle singleton so shutdown state never leaks between
+    tests (Phase 20: shutdown state lives in lifecycle, not on server)."""
+    lifecycle._lifecycle = None
 
 
 @pytest.fixture(autouse=True)
@@ -42,10 +50,10 @@ def _clean_state():
     store.events.clear()
     store.buses.clear()
     store.road_defects.clear()
-    server._SHUTDOWN_EVENT.clear()
+    _reset_lifecycle()
     yield
     store.events.clear()
-    server._SHUTDOWN_EVENT.clear()
+    _reset_lifecycle()
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -178,37 +186,44 @@ class TestShutdown:
         mgr.is_running = running
         mgr.stop = MagicMock(return_value=(True, "DDS stopped"))
         cm_mock = MagicMock()
+        ws_stop = MagicMock()
         patchers = (
             patch("ai.dds.dds_process.get_dds_manager", return_value=mgr),
             patch("ai.camera_manager.camera_manager", cm_mock),
-            patch("server.stop_websocket_server"),
-            patch("server._capture_dds_session"),
+            patch("server.stop_websocket_server", ws_stop),
+            patch("lifecycle.ApplicationLifecycle.capture_dds_session"),
         )
-        return patchers, mgr, cm_mock
+        return patchers, mgr, cm_mock, ws_stop
+
+    def _graceful_shutdown(self, patchers):
+        """Production path: register the ordered hooks, then signal shutdown."""
+        with ExitStack() as stack:
+            entered = [stack.enter_context(p) for p in patchers]
+            server._register_shutdown_hooks()
+            get_lifecycle().stop()
+        return entered
 
     def test_shutdown_with_already_stopped_dds(self):
-        patchers, mgr, cm = self._patch_components(running=False)
-        with ExitStack() as stack:
-            entered = [stack.enter_context(p) for p in patchers]
-            server._graceful_shutdown()
-        assert server._SHUTDOWN_EVENT.is_set()
+        patchers, mgr, cm, ws_stop = self._patch_components(running=False)
+        entered = self._graceful_shutdown(patchers)
+        capture_mock = entered[3]
+        assert get_lifecycle().is_shutting_down
         mgr.stop.assert_not_called()  # already stopped -> no spurious stop
-        entered[3].assert_called_once()
+        capture_mock.assert_called_once()
         cm.stop.assert_called_once()
-        entered[2].assert_called_once()
+        ws_stop.assert_called_once()
 
     def test_shutdown_with_active_dds(self):
-        patchers, mgr, cm = self._patch_components(running=True)
-        with ExitStack() as stack:
-            entered = [stack.enter_context(p) for p in patchers]
-            server._graceful_shutdown()
+        patchers, mgr, cm, ws_stop = self._patch_components(running=True)
+        entered = self._graceful_shutdown(patchers)
+        capture_mock = entered[3]
         mgr.stop.assert_called_once()
-        entered[3].assert_called_once()
+        capture_mock.assert_called_once()
         cm.stop.assert_called_once()
-        entered[2].assert_called_once()
+        ws_stop.assert_called_once()
 
     def test_new_work_refused_while_shutting_down(self):
-        server._SHUTDOWN_EVENT.set()
+        get_lifecycle().request_shutdown()
         client = server.app.test_client()
         resp = client.post("/api/dds/subprocess/start")
         assert resp.status_code == 503
@@ -227,7 +242,7 @@ class TestShutdown:
         with patch("ai.dds.dds_log_reader.get_dds_log_files", return_value=["f.csv"]), \
              patch("ai.dds.dds_log_reader.read_dds_events", return_value=[ev_a, ev_b]):
             before = len(store.events)
-            server._capture_dds_session()
+            get_lifecycle().capture_dds_session()
             after = len(store.events)
         new_events = [e for e in store.events.values() if e.get("details") == "session done"]
         assert new_events, "session-only event should have been captured"

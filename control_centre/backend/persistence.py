@@ -156,7 +156,10 @@ def _enabled():
 
 def save_event(event):
     """Persist a single event (INSERT OR REPLACE keyed on event_id). No-op
-    until init_db() has been called."""
+    until init_db() has been called.
+
+    Phase 19: Records health status for persistence operations.
+    """
     if not _enabled():
         return
     ev = dict(event)
@@ -195,8 +198,32 @@ def save_event(event):
             ),
         )
         conn.commit()
+        # Phase 19: Record successful persistence
+        _record_persistence_success()
+    except Exception as exc:
+        # Phase 19: Record persistence failure
+        _record_persistence_failure(str(exc))
+        raise
     finally:
         conn.close()
+
+
+def _record_persistence_success():
+    """Record successful persistence operation for health tracking."""
+    try:
+        from system_health import record_subsystem_success
+        record_subsystem_success("persistence")
+    except ImportError:
+        pass
+
+
+def _record_persistence_failure(error: str):
+    """Record failed persistence operation for health tracking."""
+    try:
+        from system_health import record_subsystem_failure
+        record_subsystem_failure("persistence", error, critical=False)
+    except ImportError:
+        pass
 
 
 def load_events():
@@ -650,7 +677,7 @@ def load_risk_events(bus_id: str = None, limit: int = 100) -> list:
 # ---------------------------------------------------------------------------
 
 def _ensure_incidents_table(conn):
-    """Create incidents table if it doesn't exist."""
+    """Create incidents table if it doesn't exist. Extended lifecycle support."""
     conn.execute("""
         CREATE TABLE IF NOT EXISTS incidents (
             incident_id     TEXT PRIMARY KEY,
@@ -678,9 +705,25 @@ def _ensure_incidents_table(conn):
             investigation_notes TEXT,
             timeline        TEXT,
             event_count     INTEGER,
+            assigned_to     TEXT,
+            assigned_at     TEXT,
+            responding_at   TEXT,
+            confirmed_at    TEXT,
+            response_time_seconds REAL,
+            resolution_time_seconds REAL,
             payload         TEXT NOT NULL
         )
     """)
+    # Add new columns if they don't exist (migration for existing databases)
+    for col, default in [
+        ("assigned_to", "NULL"), ("assigned_at", "NULL"),
+        ("responding_at", "NULL"), ("confirmed_at", "NULL"),
+        ("response_time_seconds", "NULL"), ("resolution_time_seconds", "NULL"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE incidents ADD COLUMN {col} TEXT")
+        except Exception:
+            pass
     conn.commit()
 
 
@@ -698,8 +741,10 @@ def save_incident(incident: dict) -> None:
                 evidence, related_event_ids, related_alert_ids, risk_info,
                 created_at, updated_at, acknowledged_by, acknowledged_at,
                 resolved_by, resolved_at, investigation_notes, timeline,
-                event_count, payload
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                event_count, assigned_to, assigned_at, responding_at,
+                confirmed_at, response_time_seconds, resolution_time_seconds,
+                payload
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             incident.get("incident_id", ""),
             incident.get("title", ""),
@@ -726,6 +771,12 @@ def save_incident(incident: dict) -> None:
             json.dumps(incident.get("investigation_notes", [])),
             json.dumps(incident.get("timeline", [])),
             incident.get("event_count", 0),
+            incident.get("assigned_to"),
+            incident.get("assigned_at"),
+            incident.get("responding_at"),
+            incident.get("confirmed_at"),
+            incident.get("response_time_seconds"),
+            incident.get("resolution_time_seconds"),
             json.dumps(incident, default=str),
         ))
         conn.commit()

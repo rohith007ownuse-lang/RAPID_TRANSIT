@@ -5,6 +5,7 @@ import { StatusBadge } from '../components/UI.jsx'
 import CameraGrid from '../components/CameraFeed.jsx'
 import Gauge from '../components/Gauge.jsx'
 import AlertFeed from '../components/AlertFeed.jsx'
+import SuggestSearch from '../components/SuggestSearch.jsx'
 import { subscribe, getCall, answerCall, declineCall } from '../lib/callCenter.js'
 
 function driverState(driver) {
@@ -90,7 +91,22 @@ function BusGrid({ buses, selectedBusId, onSelect }) {
     <div className="card mb-16">
       <div className="card-header">
         <h3 className="card-title">Select Bus</h3>
-        <span className="muted" style={{ fontSize: 12 }}>{buses.length} buses</span>
+        <div className="flex align-center gap-8">
+          {/* suggestion search beside the header — same SuggestSearch used on
+              Live Fleet: first characters suggest buses, more chars narrow it */}
+          <SuggestSearch
+            items={buses.map((b) => ({
+              key: b.bus_id,
+              label: b.bus_id,
+              sublabel: `${b.driver?.name || 'driver'} · ${b.route || ''}`,
+              keywords: `${b.reg_no || ''} ${b.route || ''} ${b.driver?.name || ''}`,
+            }))}
+            placeholder="Search bus… (type D → D7, D70…)"
+            onSelect={(it) => onSelect(it.label)}
+            style={{ width: 280 }}
+          />
+          <span className="muted" style={{ fontSize: 12 }}>{buses.length} buses</span>
+        </div>
       </div>
 
       {/* Alert buses at top */}
@@ -193,8 +209,8 @@ export default function DriverSafety() {
             <CameraGrid
               cams={{
                 driver: { active: true, status: `LIVE · ${driver.state}`, meta: 'Driver webcam (bus node)' },
-                cabin: { active: false, status: 'PLANNED', meta: 'Cabin camera to be added' },
-                road: { active: false, status: 'PLANNED', meta: 'Front camera to be added' },
+                cabin: { active: true, status: 'LIVE · CCTV', meta: 'Cabin camera · passengers & driver alert' },
+                road: { active: true, status: 'LIVE', meta: 'Front road camera · pothole detection' },
               }}
             />
           </div>

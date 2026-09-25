@@ -269,7 +269,7 @@ class TestClustering:
     def test_nearby_defects_cluster(self):
         defects = [
             _make_defect(13.080, 80.270, buses=["B1"]),
-            _make_defect(13.081, 80.271, buses=["B2"]),
+            _make_defect(13.0802, 80.270, buses=["B2"]),
         ]
         clusters = _cluster_defects(defects)
         assert len(clusters) == 1
@@ -885,18 +885,25 @@ class TestEdgeCases:
 
     def test_cluster_radius_boundary(self):
         # Defects exactly at CLUSTER_RADIUS_KM should cluster
-        # Use coordinates ~300m apart
+        # Use coordinates ~20m apart
         d1 = _make_defect(13.080, 80.270)
-        d2 = _make_defect(13.082, 80.270)  # ~220m apart
+        d2 = _make_defect(13.0802, 80.270)  # ~22m apart
         clusters = _cluster_defects([d1, d2])
         assert len(clusters) == 1
+
+    def test_just_beyond_cluster_radius_separate(self):
+        # Defects beyond 30m should NOT be merged into one point
+        d1 = _make_defect(13.080, 80.270)
+        d2 = _make_defect(13.0805, 80.270)  # ~55m apart
+        clusters = _cluster_defects([d1, d2])
+        assert len(clusters) == 2
 
     def test_score_level_boundaries(self):
         assert _level_for_score(0) == "LOW"
         assert _level_for_score(29) == "LOW"
         assert _level_for_score(30) == "MEDIUM"
-        assert _level_for_score(54) == "MEDIUM"
-        assert _level_for_score(55) == "HIGH"
+        assert _level_for_score(59) == "MEDIUM"
+        assert _level_for_score(60) == "HIGH"
         assert _level_for_score(79) == "HIGH"
         assert _level_for_score(80) == "CRITICAL"
         assert _level_for_score(100) == "CRITICAL"

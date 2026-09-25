@@ -65,6 +65,9 @@ def build_parser():
                    help="Skip the interactive calibration GUI.")
     p.add_argument("--duration", type=float, default=0.0,
                    help="Run for N seconds then stop (0 = run until Ctrl+C).")
+    p.add_argument("--edge-traffic", action="store_true",
+                   help="Run edge traffic detection on the ROAD camera and stream "
+                        "counts (not frames) to the Control Centre (Phase 15).")
     return p
 
 
@@ -81,8 +84,50 @@ def main():
     if args.camera_index != 0:
         manager.cameras["DRIVER"].index = args.camera_index
     started = manager.start_active()
+    # ROAD slot: open a REAL forward camera for edge traffic detection when the
+    # operator asks for it (default config keeps ROAD as a planned placeholder).
+    if args.edge_traffic:
+        try:
+            from bus_node.cameras.road_camera import RoadCamera
+            real = manager.cameras.get("ROAD")
+            road_index = int(config.get("cameras.road.index", 2))
+            if isinstance(real, RoadCamera) and real.status != "ACTIVE":
+                # try to open the configured road device directly; honour
+                # honesty rules (never claim a camera that did not open).
+                cap = cv2.VideoCapture(road_index)
+                if cap.isOpened():
+                    cap_ref = cap
+
+                    class _RealRoad:
+                        slot = "ROAD"
+                        status = "ACTIVE"
+
+                        def start(self):
+                            return True
+
+                        def read(self):
+                            return cap_ref.read()
+
+                        def release(self):
+                            cap_ref.release()
+
+                        def info(self):
+                            return {"slot": "ROAD", "kind": "real",
+                                    "resolution": [640, 480], "status": "ACTIVE"}
+
+                    manager.cameras["ROAD"] = _RealRoad()
+                    manager.slots = ("DRIVER", "CABIN", "ROAD")
+                    print(f"[bus_node] ROAD camera opened (device #{road_index}) "
+                          f"for edge traffic AI")
+                else:
+                    cap.release()
+                    print("[bus_node] WARNING: could not open ROAD camera; "
+                          "edge traffic will idle honestly")
+        except Exception as e:
+            print(f"[bus_node] edge-traffic camera setup failed: {e}")
     print(f"Cameras: {manager.summary()}")
     print("NOTE: 3-slot architecture - DRIVER real camera, CABIN/ROAD planned placeholders")
+    print("      (--edge-traffic turns ROAD into a real forward camera for edge vehicle AI)")
 
     driver_cam = manager.cameras["DRIVER"]
     has_camera = driver_cam.status == "ACTIVE"
@@ -120,6 +165,31 @@ def main():
         client.start()
         client.send_hello()
         print(f"WebSocket: streaming to {ws_url}")
+
+    # ---- edge traffic AI (Phase 15): detect on-bus, stream only counts ----
+    edge_traffic = None
+    if args.edge_traffic:
+        try:
+            from bus_node.ai_modules.edge_traffic_detector import EdgeTrafficDetector
+
+            def _road_frame_source():
+                return manager.get_frame("ROAD")
+
+            def _road_event_emit(ev):
+                if client is not None:
+                    client.send_event(ev)
+
+            edge_traffic = EdgeTrafficDetector(
+                bus_id=bus_id, frame_source=_road_frame_source,
+                send_callback=_road_event_emit,
+                infer_interval_sec=float(config.get("bus.infer_interval", 1.0)),
+            )
+            edge_traffic.load_model()
+            edge_traffic.start()
+            print(f"[bus_node] edge traffic AI active (counts streamed to Control Centre, no raw frames)")
+        except Exception as e:
+            print(f"[bus_node] edge traffic AI failed to start: {e}")
+            edge_traffic = None
 
     print("[" + "-" * 60 + "]")
     print(f"bus:        {bus_id}")
@@ -190,12 +260,15 @@ def main():
     except KeyboardInterrupt:
         print("\n[bus_node] Stopped by user.")
     finally:
+        if edge_traffic is not None:
+            edge_traffic.stop()
         if client is not None:
             client.send_bus_state(bus.snapshot())
             client.stop()
         manager.release_all()
         print(f"[bus_node] final: {bus.bus_id} | {len(bus.events)} events recorded | "
-              f"{sum(1 for c in bus.camera_status if c['status'] == 'ACTIVE')} live cameras")
+              f"{sum(1 for c in bus.camera_status if c['status'] == 'ACTIVE')} live cameras"
+              + (f" | edge traffic frames={edge_traffic.stats()['frames_processed']}" if edge_traffic else ""))
 
 
 if __name__ == "__main__":

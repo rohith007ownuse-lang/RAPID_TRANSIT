@@ -1,4 +1,4 @@
-# SESSION RECALL — AI Urban Intelligence Platform
+# SESSION RECALL — Rapid Transit
 
 > Durable memory file. Purpose: let a fresh session pick up instantly —
 > what this project is, how it is structured, what was done in past
@@ -39,7 +39,7 @@ Desktop launcher: `start.sh`. Ports: **API 5001, WS 8765, UI 5173**.
 ## 2. Repository layout (current)
 
 ```
-AI_Urban_Intelligence_Platform/
+Rapid-Tracker/
 ├── PLAN.md / README.md / URBAN_INTELLIGENCE_OVERVIEW.md
 ├── ai_urban_management.md        # phase log (1–9)
 ├── SESSION_RECALL.md             # ← this file
@@ -241,7 +241,7 @@ webcam-AI perception prototype ("FLEET-IQ"), switchable from the UI.
 - `cv2.VideoCapture(0)` must be opened in the **main process** (via
   `open_shared_camera()`) or Flask threads deadlock — CameraManager reuses
   that pre-opened capture.
-- Driver detector hard-codes paths to `/home/rohith/Desktop/AI_Urban_Intelligence_Platform/...`
+- Driver detector hard-codes paths to `/home/rohith/Desktop/Rapid-Tracker/...`
   for cascades + `models/face_landmarker.task` — these match this machine
   but are NOT portable.
 - Cabin AI deliberately returns no detections until a real model is wired in

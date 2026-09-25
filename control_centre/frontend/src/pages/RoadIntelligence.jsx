@@ -3,11 +3,38 @@ import { api, usePoll } from '../api.js'
 import { PageHeader, SimBadge } from '../components/Layout.jsx'
 import FleetMap from '../components/FleetMap.jsx'
 import { riskTone } from '../components/UI.jsx'
+import { RoadCorridorCard } from '../components/V2IntelligencePanels.jsx'
 
 const RANGES = ['Today', 'Last 7 days', 'Last 30 days']
 
+/* Demo "photo" of a road defect (inline SVG placeholder for demonstration). */
+function DefectPhoto({ type }) {
+  return (
+    <div
+      style={{
+        width: 96, height: 72, borderRadius: 8, border: '1px solid var(--border)',
+        overflow: 'hidden', flexShrink: 0, position: 'relative',
+      }}
+    >
+      <svg width="96" height="72" viewBox="0 0 96 72" xmlns="http://www.w3.org/2000/svg">
+        <rect width="96" height="72" fill="#dbe4ee" />
+        <rect y="6" width="96" height="16" fill="#9db7d1" />
+        <rect y="30" width="96" height="28" fill="#3b4a5a" />
+        <rect y="30" width="8" height="28" fill="#f8fafc" />
+        <rect x="20" y="30" width="8" height="28" fill="#f8fafc" />
+        <rect x="40" y="30" width="8" height="28" fill="#f8fafc" />
+        <rect x="60" y="30" width="8" height="28" fill="#f8fafc" />
+        <circle cx="72" cy="48" r="7" fill="#111827" />
+        <polygon points="58,56 62,42 66,56" fill="#f59e0b" />
+        <polygon points="56,42 62,30 68,42" fill="#b91c1c" />
+        <text x="6" y="20" fontSize="9" fill="#334155" fontFamily="Segoe UI, Arial, sans-serif" fontWeight="700">{type}</text>
+      </svg>
+    </div>
+  )
+}
+
 const SOURCE_STYLES = {
-  SIMULATION: { bg: '#ede9fe', color: '#7c3aed', label: 'SIMULATION' },
+  SIMULATION: { bg: '#ede9fe', color: '#7c3aed', label: 'ESTIMATED' },
   HEURISTIC: { bg: '#fef3c7', color: '#b45309', label: 'HEURISTIC' },
   MODEL: { bg: '#d1fae5', color: '#047857', label: 'MODEL' },
   LIVE: { bg: '#fee2e2', color: '#dc2626', label: 'LIVE' },
@@ -59,6 +86,10 @@ export default function RoadIntelligence() {
     return defects.filter((d) => new Date(d.last_detected).getTime() >= cutoff)
   }, [defects, range])
 
+  /* Potholes/defects re-spotted at the same spot by different buses */
+  const repeated = useMemo(() => filtered.filter((d) => (d.buses?.length || 0) > 1), [filtered])
+  const repeatedTotal = repeated.reduce((n, d) => n + (d.buses?.length || 0), 0)
+
   const exposedBuses = exposures.filter((e) => e.exposure_state === 'EXPOSED')
   const approachingBuses = exposures.filter((e) => e.exposure_state === 'APPROACHING')
 
@@ -104,6 +135,10 @@ export default function RoadIntelligence() {
         </div>
       </div>
 
+      {/* Road Risk Corridors — moved here from the dashboard so corridor-level
+          risk lives with the rest of road intelligence. */}
+      <RoadCorridorCard />
+
       <div className="card mb-16">
         <div className="card-header">
           <h3 className="card-title">Time Range</h3>
@@ -144,27 +179,65 @@ export default function RoadIntelligence() {
                     <span className="alert-title">⚠ {d.type}</span>
                     <div className="flex gap-4">
                       <span className="badge badge-amber">×{d.detection_count}</span>
-                      <SourceBadge source={d.data_source === 'live' ? 'LIVE' : 'SIMULATION'} />
+                      <SourceBadge source={d.data_source === 'live' ? 'LIVE' : 'ESTIMATED'} />
                     </div>
                   </div>
-                  <div className="alert-meta">
-                    first detected {new Date(d.first_detected).toLocaleString()}
-                    <br />
-                    last detected {new Date(d.last_detected).toLocaleString()} · confidence {Math.round(d.confidence * 100)}%
-                    <br />
-                    seen by: <strong>{d.buses.join(', ')}</strong>
-                    <br />
-                    <span className="mono">{d.latitude.toFixed(4)}, {d.longitude.toFixed(4)}</span>
+                  <div className="flex" style={{ gap: 12, marginTop: 8, alignItems: 'flex-start' }}>
+                    <DefectPhoto type={d.type} />
+                    <div className="alert-meta" style={{ flex: 1, lineHeight: 1.6 }}>
+                      <div>Pothole detected at {new Date(d.last_detected).toLocaleString()}</div>
+                      {d.buses?.length > 0 && (
+                        <div>Seen by bus: <strong>{d.buses.join(', ')}</strong></div>
+                      )}
+                      <div>
+                        Coordinates: <span className="mono">{(d.latitude ?? 0).toFixed(4)}, {(d.longitude ?? 0).toFixed(4)}</span>
+                      </div>
+                      <div className="muted">
+                        first seen {new Date(d.first_detected).toLocaleString()} · confidence {Math.round((d.confidence || 0) * 100)}%
+                      </div>
+                    </div>
                   </div>
                   <div className="mt-8">
                     <div className="progress">
-                      <div style={{ width: `${Math.round(d.confidence * 100)}%`, background: 'var(--amber)' }} />
+                      <div style={{ width: `${Math.round((d.confidence || 0) * 100)}%`, background: 'var(--amber)' }} />
                     </div>
                   </div>
                 </div>
               ))}
           </div>
         </div>
+      </div>
+
+      {/* Re-spotted potholes — repeated at the same place by different buses */}
+      <div className="card mb-16">
+        <div className="card-header">
+          <h3 className="card-title">Potholes Re-Spotted by Other Buses</h3>
+          <span className="badge badge-amber">
+            {repeated.length} spot(s) · {repeatedTotal} detection(s) by different vehicles
+          </span>
+        </div>
+        {repeated.length === 0 ? (
+          <div className="empty">No pothole in this range was detected twice by different buses yet.</div>
+        ) : (
+          <div className="grid" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 12 }}>
+            {repeated
+              .slice()
+              .sort((a, b) => (b.buses?.length || 0) - (a.buses?.length || 0))
+              .map((d) => (
+                <div className="card" key={`repeat-${d.defect_id}`} style={{ padding: '10px 14px' }}>
+                  <div className="flex justify-between align-center mb-4">
+                    <strong>⚠ {d.type}</strong>
+                    <span className="badge badge-amber">×{d.detection_count}</span>
+                  </div>
+                  <div style={{ fontSize: 12, lineHeight: 1.6 }}>
+                    <div>Same spot, hit <strong>{d.buses?.length}</strong> different bus(es): <strong>{d.buses?.join(', ')}</strong></div>
+                    <div>At <span className="mono">{(d.latitude ?? 0).toFixed(4)}, {(d.longitude ?? 0).toFixed(4)}</span></div>
+                    <div className="muted">Last hit {new Date(d.last_detected).toLocaleString()}</div>
+                  </div>
+                </div>
+              ))}
+          </div>
+        )}
       </div>
 
       {/* Risk Zones with evidence */}
@@ -195,8 +268,8 @@ export default function RoadIntelligence() {
                 </div>
                 <div style={{ fontSize: 12, lineHeight: 1.6 }}>
                   <div>{z.defect_count} defect(s) · {z.total_detections} detections</div>
-                  <div>Routes: {z.routes_affected.join(', ') || '—'}</div>
-                  <div>Buses: {z.affected_buses.slice(0, 3).join(', ')}{z.affected_buses.length > 3 ? ` +${z.affected_buses.length - 3}` : ''}</div>
+                  <div>Routes: {(z.routes_affected || []).join(', ') || '—'}</div>
+                  <div>Buses: {(z.affected_buses || []).slice(0, 3).join(', ')}{(z.affected_buses || []).length > 3 ? ` +${z.affected_buses.length - 3}` : ''}</div>
                   <div>Type: {z.top_defect_type}</div>
                   <div className="flex gap-4 mt-4">
                     <SourceBadge source={z.source} />
@@ -356,10 +429,10 @@ export default function RoadIntelligence() {
           <h3 className="card-title">How repeated detections become one road issue</h3>
         </div>
         <div className="muted" style={{ fontSize: 13, lineHeight: 1.8 }}>
-          Multiple detections within 300m are grouped into one <strong>road-defect cluster</strong>.
+          Multiple detections within 30m are grouped into one <strong>road-defect cluster</strong>.
           Recurring clusters (spanning {'>'}30 minutes) receive higher risk scores.
           Each risk zone shows its evidence: detection count, affected buses/routes, source
-          (SIMULATION/HEURISTIC/LIVE), and temporal pattern. Bus exposure considers both
+          (ESTIMATED/HEURISTIC/LIVE), and temporal pattern. Bus exposure considers both
           proximity and route overlap for accurate operational awareness.
         </div>
       </div>

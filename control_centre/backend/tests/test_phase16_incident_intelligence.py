@@ -40,7 +40,7 @@ class TestIncidentModel:
     def test_create_default_incident(self):
         inc = Incident()
         assert inc.incident_id.startswith("INC-")
-        assert inc.status == "OPEN"
+        assert inc.status == "DETECTED"
         assert inc.severity == "MEDIUM"
         assert inc.priority == "MEDIUM"
         assert inc.category == "SYSTEM"
@@ -71,7 +71,7 @@ class TestIncidentModel:
         d = inc.to_dict()
         assert d["incident_id"] == "INC-001"
         assert d["title"] == "Test"
-        assert d["status"] == "OPEN"
+        assert d["status"] == "DETECTED"
         assert d["event_count"] == 0
 
     def test_add_timeline_entry(self):
@@ -250,6 +250,53 @@ class TestIncidentStore:
         result = self.store.close_incident("INC-001", "sup1")
         assert result is not None
         assert result.status == "CLOSED"
+    def test_confirm_incident(self):
+        inc = Incident(incident_id="INC-001", status="DETECTED")
+        self.store._add_incident(inc)
+        result = self.store.confirm_incident("INC-001", "op1")
+        assert result is not None
+        assert result.status == "CONFIRMED"
+        assert result.confirmed_at is not None
+
+    def test_confirm_incident_invalid_status(self):
+        inc = Incident(incident_id="INC-001", status="OPEN")
+        self.store._add_incident(inc)
+        assert self.store.confirm_incident("INC-001", "op1") is None
+
+    def test_assign_incident(self):
+        inc = Incident(incident_id="INC-001", status="OPEN")
+        self.store._add_incident(inc)
+        result = self.store.assign_incident("INC-001", "sup1", "op2")
+        assert result is not None
+        assert result.status == "ASSIGNED"
+        assert result.assigned_to == "op2"
+        assert result.assigned_at is not None
+
+    def test_assign_incident_requires_assignee(self):
+        inc = Incident(incident_id="INC-001", status="OPEN")
+        self.store._add_incident(inc)
+        assert self.store.assign_incident("INC-001", "sup1", "") is None
+        assert self.store.assign_incident("INC-001", "sup1", "   ") is None
+        assert self.store.get_incident("INC-001").status == "OPEN"
+
+    def test_assign_incident_invalid_status(self):
+        inc = Incident(incident_id="INC-001", status="RESOLVED")
+        self.store._add_incident(inc)
+        assert self.store.assign_incident("INC-001", "sup1", "op2") is None
+
+    def test_respond_incident(self):
+        inc = Incident(incident_id="INC-001", status="OPEN")
+        self.store._add_incident(inc)
+        self.store.assign_incident("INC-001", "sup1", "op2")
+        result = self.store.respond_incident("INC-001", "op2")
+        assert result is not None
+        assert result.status == "RESPONDING"
+        assert result.response_time_seconds is not None
+
+    def test_respond_incident_invalid_status(self):
+        inc = Incident(incident_id="INC-001", status="RESOLVED")
+        self.store._add_incident(inc)
+        assert self.store.respond_incident("INC-001", "op2") is None
 
 
 # ---------------------------------------------------------------------------
@@ -344,11 +391,14 @@ class TestEventProcessing:
 
         # Wait a bit and create different type event (should correlate)
         time.sleep(0.1)
+        # NOTE: VEHICLE_ANOMALY was removed from INCIDENT_TRIGGER_TYPES (it
+        # flooded the workflow with vehicle-health noise), so use another real
+        # trigger type from the same alert system instead.
         event2 = {
             "event_id": "EVT-002",
-            "event_type": "VEHICLE_ANOMALY",
+            "event_type": "OVERLOAD",
             "bus_id": "BUS-001",
-            "severity": "INFO",
+            "severity": "WARNING",
             "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
         result2 = process_event(event2)
@@ -648,6 +698,64 @@ class TestIncidentAPI:
         assert resp.status_code == 200
         data = resp.get_json()
         assert data["incident"]["status"] == "ACKNOWLEDGED"
+
+    def test_confirm_incident(self, client):
+        token = _login(client)
+        inc = Incident(incident_id="INC-CFM-001", status="DETECTED")
+        incident_store._add_incident(inc)
+        resp = client.post("/api/incidents/INC-CFM-001/confirm",
+                          json={"operator": "admin"},
+                          headers=_headers(token))
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["incident"]["status"] == "CONFIRMED"
+
+    def test_assign_incident(self, client):
+        token = _login(client)
+        inc = Incident(incident_id="INC-ASG-001", status="OPEN")
+        incident_store._add_incident(inc)
+        resp = client.post("/api/incidents/INC-ASG-001/assign",
+                          json={"operator": "admin", "assignee": "op2"},
+                          headers=_headers(token))
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["incident"]["status"] == "ASSIGNED"
+        assert data["incident"]["assigned_to"] == "op2"
+
+    def test_assign_incident_requires_assignee(self, client):
+        token = _login(client)
+        inc = Incident(incident_id="INC-ASG-002", status="OPEN")
+        incident_store._add_incident(inc)
+        resp = client.post("/api/incidents/INC-ASG-002/assign",
+                          json={"operator": "admin"},
+                          headers=_headers(token))
+        assert resp.status_code == 400
+
+    def test_assign_incident_not_found(self, client):
+        token = _login(client)
+        resp = client.post("/api/incidents/INC-MISSING/assign",
+                          json={"operator": "admin", "assignee": "op2"},
+                          headers=_headers(token))
+        assert resp.status_code == 404
+
+    def test_respond_incident(self, client):
+        token = _login(client)
+        inc = Incident(incident_id="INC-RSP-001", status="OPEN")
+        incident_store._add_incident(inc)
+        client.post("/api/incidents/INC-RSP-001/assign",
+                   json={"operator": "admin", "assignee": "op2"},
+                   headers=_headers(token))
+        resp = client.post("/api/incidents/INC-RSP-001/respond",
+                          json={"operator": "op2"},
+                          headers=_headers(token))
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["incident"]["status"] == "RESPONDING"
+
+    def test_assign_endpoint_requires_auth(self, client):
+        resp = client.post("/api/incidents/INC-X/assign",
+                          json={"operator": "admin", "assignee": "op2"})
+        assert resp.status_code in (401, 503)
 
     def test_incident_by_bus(self, client):
         inc1 = Incident(incident_id="INC-001", bus_id="BUS-001")

@@ -54,9 +54,14 @@ BUS = {"bus_id": "PROTO-001", "occupancy": {"passengers": 0, "pct": 0, "capacity
 
 @pytest.fixture(autouse=True)
 def _cabin_env(monkeypatch):
-    """Deterministic env for cabin occupancy regardless of host environment."""
+    """Deterministic env for cabin occupancy regardless of host environment.
+
+    The real person model is explicitly disabled here so the engine/heuristic
+    tests stay hermetic and never pay the torch/YOLO load cost. Real-model
+    behaviour is covered by dedicated tests with injected fakes.
+    """
     monkeypatch.delenv("FLEETIQ_CAMERA_BUS_ID", raising=False)
-    monkeypatch.delenv("FLEETIQ_CABIN_MODEL_PATH", raising=False)
+    monkeypatch.setenv("FLEETIQ_CABIN_MODEL_PATH", "off")
     monkeypatch.delenv("FLEETIQ_CABIN_DEFAULT_CAPACITY", raising=False)
     monkeypatch.delenv("FLEETIQ_CABIN_INFERENCE_INTERVAL_SEC", raising=False)
 
@@ -228,8 +233,18 @@ class TestHeuristicEstimator:
 
 
 class TestRealModelSlot:
-    def test_real_model_not_available_by_default(self, monkeypatch):
+    def test_real_model_resolves_in_repo_weights_by_default(self, monkeypatch):
+        # No explicit env -> falls back to the in-repo yolov8n.pt (COCO person).
         monkeypatch.delenv("FLEETIQ_CABIN_MODEL_PATH", raising=False)
+        m = CabinMLPersonDetector()
+        assert m.available is True
+        assert m.model_path is not None and m.model_path.endswith(".pt")
+        assert m.error is None
+        # Lazy: constructing must NOT load torch/YOLO yet.
+        assert m._model is None
+
+    def test_real_model_explicitly_disabled(self, monkeypatch):
+        monkeypatch.setenv("FLEETIQ_CABIN_MODEL_PATH", "off")
         m = CabinMLPersonDetector()
         assert m.available is False
         assert m.estimate(BLACK, 40) == (None, None, None)
@@ -332,9 +347,13 @@ class TestCabinOccupancyEngine:
         assert eng.public_state()["occupancy_count"] == 0
 
     def test_real_model_flag(self, monkeypatch):
-        monkeypatch.delenv("FLEETIQ_CABIN_MODEL_PATH", raising=False)
+        # Fixture disables the person model -> flag honestly reports False.
         eng = _engine()
         assert eng.public_state()["real_model_available"] is False
+        # With no explicit setting, the in-repo weights resolve -> True.
+        monkeypatch.delenv("FLEETIQ_CABIN_MODEL_PATH", raising=False)
+        eng2 = _engine()
+        assert eng2.public_state()["real_model_available"] is True
 
     def test_inference_fps_none_when_no_successful_inference(self):
         # Disconnected camera: no estimates => inference_fps stays None (never
@@ -370,6 +389,66 @@ class TestCabinOccupancyEngine:
         time.sleep(0.25)
         eng.stop()
         assert eng._inference_count <= 10
+
+
+class FakePersonModel:
+    """Injectable stand-in for CabinMLPersonDetector (no torch needed)."""
+    kind = "ml-person-detector"
+    estimator_type = "real-model"
+    available = True
+
+    def __init__(self, result=(3, 0.9, "person-detector(yolo)"), boxes=None, raise_=False):
+        self._result = result
+        self.last_boxes = boxes if boxes is not None else [[10, 10, 50, 90]]
+        self._raise = raise_
+
+    def estimate(self, frame, capacity):
+        if self._raise:
+            raise RuntimeError("yolo boom")
+        return self._result
+
+
+def _engine_with_real(real):
+    cm = FakeCameraManager("CONNECTED", frame=BLACK)
+    st = FakeStore()
+    st.upsert_bus(dict(BUS))
+    return CabinOccupancyEngine(cm, st, FakeMode(is_live=True),
+                                estimator=CabinHeuristicEstimator(),
+                                real_model=real, interval=0.05)
+
+
+class TestRealPersonCount:
+    def test_real_count_preferred_over_heuristic(self):
+        eng = _engine_with_real(FakePersonModel(result=(3, 0.87, "person-detector(yolo)")))
+        eng._tick()
+        st = eng.public_state()
+        assert st["occupancy_count"] == 3
+        assert st["occupancy_percentage"] == 8  # 3 of 40 seats
+        assert st["estimator"] == "ml-person-detector"
+        assert st["estimator_type"] == "real-model"
+        assert st["confidence"] == 0.87
+        assert st["source"] == "cabin_camera"
+        assert st["model"] == "person-detector(yolo)"
+        assert st["person_boxes"] == [[10, 10, 50, 90]]
+        assert st["estimator_in_use"] == "real-model (ml-person-detector)"
+        assert st["real_model_available"] is True
+        assert eng._store.buses["PROTO-001"]["cabin_occupancy"]["occupancy_count"] == 3
+
+    def test_real_none_falls_back_to_heuristic(self):
+        eng = _engine_with_real(FakePersonModel(result=(None, None, None)))
+        eng._tick()
+        st = eng.public_state()
+        assert st["occupancy_count"] == 0  # heuristic BLACK first tick
+        assert st["estimator"] == "heuristic"
+        assert st["confidence"] is None
+        assert st["estimator_in_use"] == "heuristic (development)"
+
+    def test_real_error_is_isolated_to_heuristic(self):
+        eng = _engine_with_real(FakePersonModel(raise_=True))
+        eng._tick()  # must not raise
+        st = eng.public_state()
+        assert st["occupancy_count"] == 0
+        assert st["estimator"] == "heuristic"
 
 
 # ------------------------------------------------------------------------ API

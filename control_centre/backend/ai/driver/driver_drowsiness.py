@@ -43,15 +43,16 @@ if PROJECT_ROOT not in sys.path:
 # ─── Thresholds (defaults from config/system_config.json) ───
 EAR_THRESHOLD = 0.23
 MAR_THRESHOLD = 0.40
-EYE_CLOSED_DURATION = 1.3
+EYE_CLOSED_DURATION = 2.3       # Alarm if eyes closed for this long
 YAWN_DURATION = 1.0
 HEAD_POSE_ALERT_DEVIATION = 15.0
 HEAD_POSE_ALERT_DURATION = 2.5
 HEAD_NOD_DEVIATION = 15.0
-HEAD_NOD_DURATION = 1.3
-PERCLOS_WINDOW_SEC = 60.0
+HEAD_NOD_DURATION = 2.3         # Alarm if head nodding for this long
+PERCLOS_WINDOW_SEC = 90.0       # PERCLOS calculated over 90s window
 PERCLOS_THRESHOLD = 0.15
 PERCLOS_MIN_SAMPLES = 30
+FACE_LOST_DURATION = 2.3        # Alarm if face not detected for this long
 
 # ─── Calibration (original DDS calibration.py constants) ───
 CALIBRATION_DURATION = 5.0
@@ -303,6 +304,7 @@ class DriverDrowsinessDetector:
         self._ear_timestamps = deque()
         self._head_nod_start = None
         self._head_pose_alert_start = None
+        self._face_lost_start = None  # When face disappeared
 
         # ── Audio (original DDS alert manager, lazy) ──
         self._audio = None
@@ -313,12 +315,28 @@ class DriverDrowsinessDetector:
     def _ensure_audio(self):
         """Load the ORIGINAL DDS alert manager (bus_node.utils.alert_manager)."""
         if self._audio is not None:
+            # Always sync muted state from feature toggle
+            try:
+                from feature_toggles import feature_toggles
+                self._audio.muted = not feature_toggles.get("audio_alerts")
+            except Exception:
+                pass
             return self._audio_ok
         try:
+            import sys
+            import os
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..'))
             from bus_node.utils.alert_manager import AlertManager
+            # Sync muted state from feature toggle BEFORE creating instance
+            try:
+                from feature_toggles import feature_toggles
+                AlertManager.muted = not feature_toggles.get("audio_alerts")
+                print(f"[driver_dds] AlertManager.muted set to {AlertManager.muted} from feature toggle")
+            except Exception:
+                pass
             self._audio = AlertManager()
             self._audio_ok = True
-            print("[driver_dds] Original DDS AlertManager loaded (audio warning active)")
+            print(f"[driver_dds] AlertManager loaded (muted={self._audio.muted}, player={self._audio._audio_player})")
         except Exception as e:
             self._audio = None
             self._audio_ok = False
@@ -491,11 +509,13 @@ class DriverDrowsinessDetector:
 
     def _set_audio_severity(self, severity):
         if self._audio is None:
+            print("[driver_dds] _set_audio_severity: audio is None, skipping")
             return
         try:
             target = severity if severity in ("CRITICAL", "WARNING") else None
             if target != self._audio_level:
                 self._audio_level = target
+                print(f"[driver_dds] Audio severity: {self._audio_level} -> {target} (muted={self._audio.muted})")
                 self._audio.update(target)  # None stops the loop; else starts/loops
                 if target is not None:
                     self.audio_triggered += 1
@@ -551,162 +571,172 @@ class DriverDrowsinessDetector:
             # (import/model missing) — never for a per-frame "no face" miss,
             # because Haar hallucinates faces from the background and fabricates
             # EAR/MAR/drowsiness (the noise the user saw).
+            no_face = False
             lm_available = _load_landmarker()
             if lm_available:
                 lm_result = _detect_with_landmarker(frame)
                 if lm_result is None:
                     # Landmarker loaded but no face in this frame -> honest NO FACE
-                    results["state"] = "NO FACE"
-                    results["severity"] = "INFO"
-                    self._reset_trackers()
-                    return results
-
-                results["face_detected"] = True
-                results["ear"] = lm_result["ear"]
-                results["mar"] = lm_result["mar"]
-                results["head_pitch"] = lm_result["pitch"]
-                results["head_yaw"] = lm_result["yaw"]
-                results["head_roll"] = lm_result["roll"]
-                self.ear = lm_result["ear"]
-                self.mar = lm_result["mar"]
-                self.head_pitch = lm_result["pitch"]
-                self.head_yaw = lm_result["yaw"]
-                self.head_roll = lm_result["roll"]
-                results["eyes_detected"] = 2
+                    no_face = True
+                else:
+                    # Face found - reset face lost timer
+                    self._face_lost_start = None
+                    results["face_detected"] = True
+                    results["ear"] = lm_result["ear"]
+                    results["mar"] = lm_result["mar"]
+                    results["head_pitch"] = lm_result["pitch"]
+                    results["head_yaw"] = lm_result["yaw"]
+                    results["head_roll"] = lm_result["roll"]
+                    self.ear = lm_result["ear"]
+                    self.mar = lm_result["mar"]
+                    self.head_pitch = lm_result["pitch"]
+                    self.head_yaw = lm_result["yaw"]
+                    self.head_roll = lm_result["roll"]
+                    results["eyes_detected"] = 2
             else:
                 # MediaPipe truly unavailable (no model / bad install): Haar only.
                 haar_result = _detect_with_haar(frame, enhanced)
                 if haar_result is None:
-                    results["state"] = "NO FACE"
-                    results["severity"] = "INFO"
-                    self._reset_trackers()
-                    return results
+                    no_face = True
+                else:
+                    # Face found - reset face lost timer
+                    self._face_lost_start = None
+                    results["face_detected"] = True
+                    results["eyes_detected"] = haar_result["eyes_found"]
+                    results["ear"] = haar_result["ear"]
+                    results["mar"] = haar_result["mar"]
+                    self.ear = haar_result["ear"]
+                    self.mar = haar_result["mar"]
 
-                results["face_detected"] = True
-                results["eyes_detected"] = haar_result["eyes_found"]
-                results["ear"] = haar_result["ear"]
-                results["mar"] = haar_result["mar"]
-                self.ear = haar_result["ear"]
-                self.mar = haar_result["mar"]
+            if no_face:
+                # Honest NO FACE: no crash, no fake metrics, and the
+                # monitoring block below still runs so the 2.3 s face-lost
+                # alarm + event fire instead of dying on a None dereference.
+                results["state"] = "NO FACE"
+                results["severity"] = "INFO"
+                if self._face_lost_start is None:
+                    self._face_lost_start = now
+                results["face_lost_sec"] = round(now - self._face_lost_start, 2)
+                self._reset_trackers()
 
             ear = results["ear"]
             mar = results["mar"]
             pitch = results["head_pitch"]
 
-            # ─── EAR history (time-based, 60 s window) ───
-            self._ear_timestamps.append((now, ear))
-            cutoff = now - PERCLOS_WINDOW_SEC
-            while self._ear_timestamps and self._ear_timestamps[0][0] < cutoff:
-                self._ear_timestamps.popleft()
+            if not no_face:
+                # ─── EAR history (time-based, 60 s window) ───
+                self._ear_timestamps.append((now, ear))
+                cutoff = now - PERCLOS_WINDOW_SEC
+                while self._ear_timestamps and self._ear_timestamps[0][0] < cutoff:
+                    self._ear_timestamps.popleft()
 
-            # ─── Eye closure tracking (calibrated threshold) ───
-            is_closed = ear > 0 and ear < self.ear_threshold
-            if is_closed:
-                if self._eye_closed_start is None:
-                    self._eye_closed_start = now
-                closed = now - self._eye_closed_start
-                results["closed_sec"] = round(closed, 2)
-                self.eye_closed_time = closed
-            else:
-                self._eye_closed_start = None
-                results["closed_sec"] = 0.0
-                self.eye_closed_time = 0.0
+                # ─── Eye closure tracking (calibrated threshold) ───
+                is_closed = ear > 0 and ear < self.ear_threshold
+                if is_closed:
+                    if self._eye_closed_start is None:
+                        self._eye_closed_start = now
+                    closed = now - self._eye_closed_start
+                    results["closed_sec"] = round(closed, 2)
+                    self.eye_closed_time = closed
+                else:
+                    self._eye_closed_start = None
+                    results["closed_sec"] = 0.0
+                    self.eye_closed_time = 0.0
 
-            # ─── Yawn tracking (temporal MAR analysis) ───
-            # A confirmed yawn requires sustained mouth opening (> YAWN_DURATION)
-            # above the calibrated MAR threshold. Brief mouth movements (talking,
-            # coughing) are too short to qualify.
-            is_yawning = mar > self.mar_threshold
-            results["yawning"] = False
-            if is_yawning:
-                if self._yawn_start is None:
-                    self._yawn_start = now
-                elif now - self._yawn_start >= YAWN_DURATION:
-                    # Confirmed yawn: sustained MAR above threshold
-                    self.yawn_count += 1
-                    results["yawning"] = True
-                    results["yawn_count"] = self.yawn_count
-                    self._yawn_start = None  # reset for next yawn
-            else:
-                # Mouth closed / below threshold → reset the yawn timer
-                self._yawn_start = None
-            results["yawn_count"] = self.yawn_count
+                # ─── Yawn tracking (temporal MAR analysis) ───
+                # A confirmed yawn requires sustained mouth opening (> YAWN_DURATION)
+                # above the calibrated MAR threshold. Brief mouth movements (talking,
+                # coughing) are too short to qualify.
+                is_yawning = mar > self.mar_threshold
+                results["yawning"] = False
+                if is_yawning:
+                    if self._yawn_start is None:
+                        self._yawn_start = now
+                    elif now - self._yawn_start >= YAWN_DURATION:
+                        # Confirmed yawn: sustained MAR above threshold
+                        self.yawn_count += 1
+                        results["yawning"] = True
+                        results["yawn_count"] = self.yawn_count
+                        self._yawn_start = None  # reset for next yawn
+                else:
+                    # Mouth closed / below threshold → reset the yawn timer
+                    self._yawn_start = None
+                results["yawn_count"] = self.yawn_count
 
-            # ─── PERCLOS (time-based, 60 s window) ───
-            n = len(self._ear_timestamps)
-            if n:
-                closed_count = sum(1 for _, e in self._ear_timestamps if 0 < e < self.ear_threshold)
-                perclos = closed_count / n if n > 0 else 0.0
-                results["perclos"] = round(perclos, 3)
-                self.perclos = perclos
-            else:
-                results["perclos"] = 0.0
+                # ─── PERCLOS (time-based, 60 s window) ───
+                n = len(self._ear_timestamps)
+                if n:
+                    closed_count = sum(1 for _, e in self._ear_timestamps if 0 < e < self.ear_threshold)
+                    perclos = closed_count / n if n > 0 else 0.0
+                    results["perclos"] = round(perclos, 3)
+                    self.perclos = perclos
+                else:
+                    results["perclos"] = 0.0
 
-            # ─── Head nod detection (down, 15 deg, 1.3 s) ───
-            nod_detected = False
-            if pitch > HEAD_NOD_DEVIATION:
-                if self._head_nod_start is None:
-                    self._head_nod_start = now
-                elif now - self._head_nod_start >= HEAD_NOD_DURATION:
-                    nod_detected = True
+                # ─── Head nod detection (down, 15 deg, 1.3 s) ───
+                nod_detected = False
+                if pitch > HEAD_NOD_DEVIATION:
+                    if self._head_nod_start is None:
+                        self._head_nod_start = now
+                    elif now - self._head_nod_start >= HEAD_NOD_DURATION:
+                        nod_detected = True
+                        self._head_nod_start = None
+                else:
                     self._head_nod_start = None
-            else:
-                self._head_nod_start = None
 
-            # ─── Head pose alert (both, 15 deg, 2.5 s) ───
-            pose_alert = False
-            deviation = abs(pitch) + abs(results["head_yaw"])
-            if deviation > HEAD_POSE_ALERT_DEVIATION:
-                if self._head_pose_alert_start is None:
-                    self._head_pose_alert_start = now
-                elif now - self._head_pose_alert_start >= HEAD_POSE_ALERT_DURATION:
-                    pose_alert = True
+                # ─── Head pose alert (both, 15 deg, 2.5 s) ───
+                pose_alert = False
+                deviation = abs(pitch) + abs(results["head_yaw"])
+                if deviation > HEAD_POSE_ALERT_DEVIATION:
+                    if self._head_pose_alert_start is None:
+                        self._head_pose_alert_start = now
+                    elif now - self._head_pose_alert_start >= HEAD_POSE_ALERT_DURATION:
+                        pose_alert = True
+                        self._head_pose_alert_start = None
+                else:
                     self._head_pose_alert_start = None
-            else:
-                self._head_pose_alert_start = None
 
-            # ─── State classification (original DDS fatigue_engine logic) ───
-            if self.eye_closed_time >= EYE_CLOSED_DURATION:
-                results["state"] = "DROWSINESS DETECTED"
-                results["severity"] = "CRITICAL"
-                results["drowsy"] = True
-                results["confidence"] = min(0.95, 0.7 + self.eye_closed_time * 0.1)
-            elif self.perclos >= PERCLOS_THRESHOLD and n >= PERCLOS_MIN_SAMPLES:
-                results["state"] = "DROWSINESS DETECTED (PERCLOS)"
-                results["severity"] = "CRITICAL"
-                results["drowsy"] = True
-                results["confidence"] = 0.85
-            elif pose_alert:
-                results["state"] = "HEAD POSE ALERT"
-                results["severity"] = "WARNING"
-                results["confidence"] = 0.7
-            elif nod_detected:
-                results["state"] = "HEAD NOD DETECTED"
-                results["severity"] = "WARNING"
-                results["confidence"] = 0.7
-            elif is_closed:
-                results["state"] = "EYES CLOSED"
-                results["severity"] = "INFO"
-                results["confidence"] = 0.5
-            else:
-                results["state"] = "NORMAL"
-                results["severity"] = "NONE"
-                results["confidence"] = 0.9
+                # ─── State classification (original DDS fatigue_engine logic) ───
+                if self.eye_closed_time >= EYE_CLOSED_DURATION:
+                    results["state"] = "DROWSINESS DETECTED"
+                    results["severity"] = "CRITICAL"
+                    results["drowsy"] = True
+                    results["confidence"] = min(0.95, 0.7 + self.eye_closed_time * 0.1)
+                elif self.perclos >= PERCLOS_THRESHOLD and n >= PERCLOS_MIN_SAMPLES:
+                    results["state"] = "DROWSINESS DETECTED (PERCLOS)"
+                    results["severity"] = "CRITICAL"
+                    results["drowsy"] = True
+                    results["confidence"] = 0.85
+                elif pose_alert:
+                    results["state"] = "HEAD POSE ALERT"
+                    results["severity"] = "WARNING"
+                    results["confidence"] = 0.7
+                elif nod_detected:
+                    results["state"] = "HEAD NOD DETECTED"
+                    results["severity"] = "WARNING"
+                    results["confidence"] = 0.7
+                elif is_closed:
+                    results["state"] = "EYES CLOSED"
+                    results["severity"] = "INFO"
+                    results["confidence"] = 0.5
+                else:
+                    results["state"] = "NORMAL"
+                    results["severity"] = "NONE"
+                    results["confidence"] = 0.9
 
-            # ─── Drowsy / attention percent ───
-            closed_ratio = min(1.0, self.eye_closed_time / EYE_CLOSED_DURATION) if self.eye_closed_time > 0 else 0.0
-            # Only use PERCLOS for the percent if enough samples (same guard as
-            # the state machine) — with 1–2 samples the ratio is meaningless.
-            perclos_ratio = min(1.0, self.perclos / PERCLOS_THRESHOLD) if self.perclos > 0 and n >= PERCLOS_MIN_SAMPLES else 0.0
-            self.drowsy_percent = round(100 * max(closed_ratio, perclos_ratio))
-            results["drowsy_percent"] = self.drowsy_percent
+                # ─── Drowsy / attention percent ───
+                closed_ratio = min(1.0, self.eye_closed_time / EYE_CLOSED_DURATION) if self.eye_closed_time > 0 else 0.0
+                # Only use PERCLOS for the percent if enough samples (same guard as
+                # the state machine) — with 1–2 samples the ratio is meaningless.
+                perclos_ratio = min(1.0, self.perclos / PERCLOS_THRESHOLD) if self.perclos > 0 and n >= PERCLOS_MIN_SAMPLES else 0.0
+                self.drowsy_percent = round(100 * max(closed_ratio, perclos_ratio))
+                results["drowsy_percent"] = self.drowsy_percent
 
-            distraction = max(closed_ratio * 100, perclos_ratio * 100)
-            self.attention_percent = max(0, 100 - round(distraction))
-            results["attention_percent"] = self.attention_percent
+                distraction = max(closed_ratio * 100, perclos_ratio * 100)
+                self.attention_percent = max(0, 100 - round(distraction))
+                results["attention_percent"] = self.attention_percent
 
             self.state = results["state"]
-
             # ─── Calibration sampling (only while phase == calibrating) ───
             if self.phase == "calibrating":
                 if results["face_detected"]:
@@ -746,9 +776,13 @@ class DriverDrowsinessDetector:
 
                 drowsy_now = status in ("DROWSINESS DETECTED", "DROWSINESS DETECTED (PERCLOS)")
                 head_now = status in ("HEAD NOD DETECTED", "HEAD POSE ALERT")
+                face_lost_now = status == "NO FACE" and results.get("face_lost_sec", 0) >= FACE_LOST_DURATION
 
                 # Audio warning (original DDS mechanism) on severity transitions
-                if drowsy_now:
+                if face_lost_now:
+                    # Face not detected for too long - CRITICAL alarm
+                    self._set_audio_severity("CRITICAL")
+                elif drowsy_now:
                     self._set_audio_severity("CRITICAL")
                 elif head_now:
                     self._set_audio_severity("WARNING")
@@ -778,6 +812,16 @@ class DriverDrowsinessDetector:
                 elif not drowsy_now and prev in ("DROWSINESS DETECTED", "DROWSINESS DETECTED (PERCLOS)"):
                     # Episode over -> re-arm for next episode
                     self._alert_issued_for_episode = False
+
+                # Face lost alert (cooldown-capped)
+                if face_lost_now and prev != "NO FACE":
+                    now_t = time.time()
+                    if now_t - self._last_event_time.get("face_lost", 0) >= 5.0:
+                        self._last_event_time["face_lost"] = now_t
+                        self._emit(self._build_event(
+                            "DRIVER_DROWSINESS", "CRITICAL", 0.9,
+                            f"Face not detected for {FACE_LOST_DURATION}s - driver may have left or camera obstructed.",
+                        ))
 
                 # Head nod / pose alert (cooldown-capped)
                 if head_now and prev not in ("HEAD NOD DETECTED", "HEAD POSE ALERT"):

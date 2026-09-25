@@ -16,7 +16,7 @@ The existing event/incident system stays the single source of truth:
        ↓
     Control Centre UI  (toast + alert centre; dismiss ≠ resolve incident)
 
-Design rules (Phase 9):
+Design rules (Phase 9, revised for the operator-focused Live Alerts policy):
 - The event IS the truth. An alert is a small projection of one event and
   always carries the original `event_id` so the UI can correlate it with the
   incident workflow. Nothing is duplicated into a second store.
@@ -24,6 +24,10 @@ Design rules (Phase 9):
   INFO (same hierarchy the risk engine / fleet summary use).
 - Alert fatigue: ordinary telemetry never alerts. INFO-level operational
   notes (passenger moments, recoveries, interventions) never alert.
+- Live Alerts tiers: CRITICAL types (crash, driver drowsiness, cabin smoke,
+  cabin fire) are pinned at the top and leave only when acknowledged.
+  WARNING types (road hazards, overload, risk escalation) queue normally.
+  VEHICLE_ANOMALY never alerts (retired — it flooded the feed).
 - Identity: one event_id ⇒ at most one alert, even if the event is re-sent
   over WebSocket or the broadcast happens twice.
 - Broadcast is best-effort and failure-isolated: if no broadcaster is
@@ -46,30 +50,37 @@ from datetime import datetime, timezone
 PRIORITY_ORDER = ["CRITICAL", "HIGH", "WARNING", "INFO"]
 PRIORITY_RANK = {name: i for i, name in enumerate(PRIORITY_ORDER)}
 
-# Event types that deserve a UI alert even at WARNING severity (meaningful
-# operational conditions that actually exist in this backend). CRITICAL/HIGH
-# events of any type alert; INFO events of any type never do.
+# ---------------------------------------------------------------------------
+# Live Alerts policy (operator-focused, anti-fatigue)
+#
+# CRITICAL — highest priority, pinned at the top of Live Alerts and only
+# removed once the operator acknowledges them:
+#   crash, driver drowsiness, smoke, fire.
+# WARNING — second priority, normal queue:
+#   road hazards, bus overload, risk escalation predictions.
+# INFO  — never alerts.
+# VEHICLE_ANOMALY — intentionally NOT alertable: it flooded the alert feed.
+# ---------------------------------------------------------------------------
+CRITICAL_ALERT_TYPES = {
+    "CRASH",                # possible crash / impact
+    "DRIVER_DROWSINESS",    # driver safety (sim + live DDS + bus nodes)
+    "CABIN_SMOKE",          # smoke in the bus
+    "CABIN_FIRE",           # fire in the bus
+}
+
 WARNING_ALERT_TYPES = {
-    "DRIVER_DROWSINESS",       # driver safety (sim + live DDS + bus nodes)
-    "DRIVER_ALERT",            # cabin audio warning issued
-    "DRIVER_REFRESH_REQUIRED",  # long-term fatigue elevated
-    "CRASH",                   # possible crash / impact
-    "CABIN_FIRE",
-    "CABIN_SMOKE",
-    "CABIN_INCIDENT",
-    "EMERGENCY_SIREN",
-    "OVERLOAD",                # passenger overload
-    "VEHICLE_ANOMALY",
     "POTHOLE",                 # road hazard
-    "ROAD_DEFECT",
-    "BUS_OFFLINE",             # live node stopped sending telemetry (watchdog)
-    "ETA_SEVERE_DELAY",        # Phase 13: significant operational delay
-    "CAPACITY_PRESSURE",       # Phase 14: forecast demand exceeds capacity
-    "OVERCROWDING",            # Phase 14: sustained overcrowding detected
-    "RISK_STATE_CHANGE",       # Phase 15: meaningful risk state transition
-    "RISK_ESCALATION",         # Phase 15: risk escalated to higher level
-    "RISK_RECOVERY",           # Phase 15: risk decreased to lower level
-    "CRITICAL_RISK",           # Phase 15: critical risk detected
+    "ROAD_DEFECT",             # road hazard
+    "OVERLOAD",                # bus overload
+    "RISK_ESCALATION",         # risk escalation prediction
+    "CRITICAL_RISK",           # risk escalated to the top band
+    "RISK_STATE_CHANGE",       # meaningful risk state transition
+    "DRIVER_REFRESH_REQUIRED",  # long-term fatigue elevated
+}
+
+# Types that must NEVER surface in Live Alerts (noise sources).
+NEVER_ALERT_TYPES = {
+    "VEHICLE_ANOMALY",
 }
 
 _MAX_SEEN_IDS = 1000          # recent alert-identity window (dedup registry)
@@ -113,19 +124,37 @@ _broadcasters = []                   # callables: fn(alert_dict) -> None
 def is_alertworthy(event: dict) -> bool:
     """Should this event become a real-time UI alert?
 
-    Severity-first rule on the EXISTING event severity:
-      CRITICAL / HIGH -> always
-      WARNING         -> only for operationally meaningful types
-      INFO / unknown  -> never (avoids alert fatigue)
+    Type-first rule on the EXISTING event severity:
+      CRITICAL types (crash / drowsiness / smoke / fire) -> always alert,
+        at any severity, and are pinned until acknowledged.
+      WARNING types (road hazards / overload / risk escalation) -> only when
+        the event severity is WARNING or above.
+      INFO / unknown -> never (avoids alert fatigue).
+      VEHICLE_ANOMALY -> never (explicitly retired from Live Alerts).
     """
     if not isinstance(event, dict):
         return False
+    event_type = (event.get("event_type") or "").upper()
+    if event_type in NEVER_ALERT_TYPES:
+        return False
     severity = (event.get("severity") or "").upper()
-    if severity in ("CRITICAL", "HIGH"):
+    if event_type in CRITICAL_ALERT_TYPES:
         return True
-    if severity == "WARNING":
-        return (event.get("event_type") or "").upper() in WARNING_ALERT_TYPES
+    if event_type in WARNING_ALERT_TYPES:
+        return severity in ("CRITICAL", "HIGH", "WARNING")
     return False
+
+
+def alert_tier(event: dict) -> str:
+    """UI tier for an alert-worthy event: 'CRITICAL' or 'WARNING'.
+
+    The tier decides placement in Live Alerts: CRITICAL items are pinned at
+    the top and only leave after acknowledgement.
+    """
+    event_type = ((event or {}).get("event_type") or "").upper()
+    if event_type in CRITICAL_ALERT_TYPES:
+        return "CRITICAL"
+    return "WARNING"
 
 
 def build_alert(event: dict, bus: dict | None = None) -> dict:
@@ -152,6 +181,7 @@ def build_alert(event: dict, bus: dict | None = None) -> dict:
         "type": event.get("event_type") or "UNKNOWN",
         "severity": severity,
         "priority": PRIORITY_RANK.get(severity, len(PRIORITY_ORDER)),
+        "tier": alert_tier(event),
         "bus_id": event.get("bus_id") or "",
         "route": route,
         "title": TYPE_TITLES.get((event.get("event_type") or "").upper(),
@@ -167,9 +197,15 @@ def build_alert(event: dict, bus: dict | None = None) -> dict:
 def project_alerts(events: list) -> list:
     """Project a newest-first event list into alert payloads (for
     GET /api/alerts and reconnect reconciliation). Reads the EXISTING event
-    store — never a parallel store."""
+    store — never a parallel store.
+
+    Ordering: CRITICAL-tier unacknowledged alerts first (pinned), then
+    everything else newest-first. Acknowledged criticals drop out of the
+    pinned block — they only leave Live Alerts once acknowledged."""
     items = [build_alert(e) for e in events if is_alertworthy(e)]
+    # newest first, then a stable pass that hoists the unacknowledged criticals
     items.sort(key=lambda a: (a.get("timestamp") or "",), reverse=True)
+    items.sort(key=lambda a: 0 if (a.get("tier") == "CRITICAL" and a.get("status") == "ACTIVE") else 1)
     return items
 
 

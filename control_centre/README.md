@@ -1,6 +1,6 @@
 # Control Centre — Urban Intelligence Dashboard
 
-White-themed, professional operations dashboard for the AI Urban Intelligence Platform.
+White-themed, professional operations dashboard for the Rapid Transit.
 
 > **All dashboard data is SIMULATED demo data** until bus nodes stream real data
 > over WebSocket (a later phase). Every page shows a `SIMULATION` badge.
@@ -135,7 +135,7 @@ Vite proxies `/api` to the backend (see `vite.config.js`).
 
 ### 3. Bus node (optional — streams simulated live data into the dashboard)
 ```bash
-cd AI_Urban_Intelligence_Platform
+cd Rapid-Tracker
 python bus_node/main.py --headless --duration 30   # streams to ws://localhost:8765
 ```
 

@@ -1,7 +1,7 @@
-# Urban Intelligence Control Centre - Agent Instructions
+# Rapid Transit Control Centre - Agent Instructions
 
 ## Project Overview
-White-themed React/Flask dashboard for AI Urban Intelligence Platform.
+White-themed React/Flask dashboard for Rapid Transit.
 SIMULATED demo data until bus nodes connect via WebSocket.
 100-bus fleet with 10 MTC routes (Chennai), real-time risk, fatigue, ETA, demand, road risk.
 
@@ -41,6 +41,7 @@ All data is **SIMULATED** (SimBadge on every page) until real bus nodes stream d
 | `/load-management` | Load Management | GVW/payload table with status badges |
 | `/incidents` | Incidents | Event log with review/ack/resolve |
 | `/roads` | Road Intelligence | Defects map, risk zones, route risk index |
+| `/routes` | Route Map | All MTC GTFS routes; searchable list, click route (list or map) to highlight it + its stops |
 | `/health` | Vehicle Health | Anomaly + predictive degradation (tyre/vibration/energy) |
 | `/analytics` | Analytics | Boarding, potholes, events, severity, vehicle mix |
 | `/settings` | Settings | Sim toggle, city bounds, bus weights, detection thresholds |
@@ -53,6 +54,7 @@ All data is **SIMULATED** (SimBadge on every page) until real bus nodes stream d
 - **ETA**: `/api/eta`, `/api/buses/<id>/eta`
 - **Demand**: `/api/demand`, `/api/buses/<id>/demand`
 - **Road Risk**: `/api/roads/risk`, `/api/buses/<id>/road-threats`
+- **GTFS**: `/api/gtfs/routes/polylines?q=&limit=` — bulk polylines for the Route Map page
 - **Predictive**: `/api/health/predictive`
 
 ## WebSocket (bus_node → control centre)

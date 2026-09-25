@@ -14,6 +14,8 @@ The incident system does NOT replace events or alerts — it correlates them
 into actionable operational intelligence.
 """
 
+import os
+import random
 import threading
 import time
 import uuid
@@ -23,12 +25,39 @@ from datetime import datetime, timezone
 import persistence
 
 # ---------------------------------------------------------------------------
+# Auto-assignment (critical incidents routed to operators)
+# ---------------------------------------------------------------------------
+# Only CRITICAL incidents are auto-assigned; lower severities stay for normal
+# dashboard viewing. If the assignee does not press Respond within
+# AUTO_RESPONSE_TIMEOUT_SEC, the work is re-routed to the next operator with
+# an escalated alert; after AUTO_ASSIGN_MAX_ATTEMPTS unanswered attempts it
+# goes to a supervisor.
+AUTO_ASSIGN_SEVERITIES = {"CRITICAL"}
+
+
+def _auto_assign_timeout_sec():
+    try:
+        return max(1.0, float(os.environ.get("FLEETIQ_AUTO_ASSIGN_TIMEOUT_SEC", "3.0")))
+    except (TypeError, ValueError):
+        return 3.0
+
+
+def _auto_assign_max_attempts():
+    try:
+        return max(1, int(float(os.environ.get("FLEETIQ_AUTO_ASSIGN_MAX_ATTEMPTS", "3"))))
+    except (TypeError, ValueError):
+        return 3
+
+# ---------------------------------------------------------------------------
 # Incident severity and priority
 # ---------------------------------------------------------------------------
 
 INCIDENT_SEVERITIES = ("INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL")
 INCIDENT_PRIORITIES = ("LOW", "MEDIUM", "HIGH", "URGENT")
-INCIDENT_STATUSES = ("OPEN", "ACKNOWLEDGED", "INVESTIGATING", "RESOLVED", "CLOSED")
+INCIDENT_STATUSES = (
+    "DETECTED", "CONFIRMED", "ASSIGNED", "RESPONDING",
+    "OPEN", "ACKNOWLEDGED", "INVESTIGATING", "RESOLVED", "CLOSED"
+)
 INCIDENT_SOURCES = (
     "DRIVER_SAFETY", "DDS", "VEHICLE_HEALTH", "ROAD_INTELLIGENCE",
     "ETA", "PASSENGER_LOAD", "RISK_ENGINE", "SYSTEM", "OTHER"
@@ -42,10 +71,12 @@ INCIDENT_CATEGORIES = (
 INCIDENT_TRIGGER_TYPES = {
     "DRIVER_DROWSINESS", "DRIVER_ALERT", "DRIVER_REFRESH_REQUIRED",
     "CRASH", "CABIN_FIRE", "CABIN_SMOKE", "CABIN_INCIDENT",
-    "EMERGENCY_SIREN", "OVERLOAD", "VEHICLE_ANOMALY",
+    "EMERGENCY_SIREN", "OVERLOAD",
     "POTHOLE", "ROAD_DEFECT", "BUS_OFFLINE",
     "ETA_SEVERE_DELAY", "CAPACITY_PRESSURE", "OVERCROWDING",
     "RISK_STATE_CHANGE", "RISK_ESCALATION", "CRITICAL_RISK",
+    # NOTE: VEHICLE_ANOMALY removed — it flooded the incident workflow with
+    # vehicle-health noise (operator decision: no anomaly/info incidents).
 }
 
 # Severity mapping from event severity to incident severity
@@ -130,10 +161,10 @@ PRIORITY_RANK = {p: i for i, p in enumerate(INCIDENT_PRIORITIES)}
 # ---------------------------------------------------------------------------
 
 class Incident:
-    """Represents a meaningful operational incident."""
+    """Represents a meaningful operational incident with extended lifecycle."""
 
     def __init__(self, incident_id=None, title="", category="SYSTEM",
-                 severity="MEDIUM", priority="MEDIUM", status="OPEN",
+                 severity="MEDIUM", priority="MEDIUM", status="DETECTED",
                  bus_id=None, route=None, location=None,
                  source="SYSTEM", data_source="SIMULATION",
                  description="", evidence=None, related_event_ids=None,
@@ -141,7 +172,12 @@ class Incident:
                  created_at=None, updated_at=None,
                  acknowledged_by=None, acknowledged_at=None,
                  resolved_by=None, resolved_at=None,
-                 investigation_notes=None, timeline=None):
+                 investigation_notes=None, timeline=None,
+                 assigned_to=None, assigned_at=None,
+                 responding_at=None, confirmed_at=None,
+                 response_time_seconds=None, resolution_time_seconds=None,
+                 auto_assigned=False, assign_attempts=0, rejected_by=None,
+                 escalation_level=0, last_assigned_at=None):
         self.incident_id = incident_id or f"INC-{str(uuid.uuid4())[:8]}"
         self.title = title
         self.category = category
@@ -167,6 +203,19 @@ class Incident:
         self.investigation_notes = investigation_notes or []
         self.timeline = timeline or []
         self.event_count = len(self.related_event_ids)
+        # Extended lifecycle fields
+        self.assigned_to = assigned_to
+        self.assigned_at = assigned_at
+        self.responding_at = responding_at
+        self.confirmed_at = confirmed_at
+        self.response_time_seconds = response_time_seconds
+        self.resolution_time_seconds = resolution_time_seconds
+        # Auto-assignment fields (critical incidents routed to operators)
+        self.auto_assigned = bool(auto_assigned)
+        self.assign_attempts = int(assign_attempts or 0)
+        self.rejected_by = list(rejected_by or [])
+        self.escalation_level = int(escalation_level or 0)
+        self.last_assigned_at = last_assigned_at
 
     def to_dict(self):
         return {
@@ -190,11 +239,27 @@ class Incident:
             "updated_at": self.updated_at,
             "acknowledged_by": self.acknowledged_by,
             "acknowledged_at": self.acknowledged_at,
+            "ack_issue_type": getattr(self, "ack_issue_type", None),
+            "ack_cause": getattr(self, "ack_cause", None),
+            "ack_note": getattr(self, "ack_note", None),
             "resolved_by": self.resolved_by,
             "resolved_at": self.resolved_at,
             "investigation_notes": self.investigation_notes,
             "timeline": self.timeline,
             "event_count": self.event_count,
+            # Extended lifecycle fields
+            "assigned_to": self.assigned_to,
+            "assigned_at": self.assigned_at,
+            "responding_at": self.responding_at,
+            "confirmed_at": self.confirmed_at,
+            "response_time_seconds": self.response_time_seconds,
+            "resolution_time_seconds": self.resolution_time_seconds,
+            # Auto-assignment fields
+            "auto_assigned": self.auto_assigned,
+            "assign_attempts": self.assign_attempts,
+            "rejected_by": list(self.rejected_by),
+            "escalation_level": self.escalation_level,
+            "last_assigned_at": self.last_assigned_at,
         }
 
     def add_timeline_entry(self, action, operator=None, details=None):
@@ -222,17 +287,29 @@ class Incident:
             self.related_event_ids.append(event_id)
             self.event_count = len(self.related_event_ids)
 
-    def acknowledge(self, operator):
-        if self.status in ("OPEN", "INVESTIGATING"):
+    def acknowledge(self, operator, issue_type=None, cause=None, note=None):
+        # RESPONDING added so operators can acknowledge directly from the
+        # live feed without walking the assign → respond ladder first.
+        if self.status in ("OPEN", "INVESTIGATING", "DETECTED", "CONFIRMED", "ASSIGNED", "RESPONDING"):
             self.status = "ACKNOWLEDGED"
             self.acknowledged_by = operator
             self.acknowledged_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            self.add_timeline_entry("ACKNOWLEDGED", operator)
+            # Acknowledge popup payload — what the operator reported
+            if issue_type:
+                self.ack_issue_type = issue_type
+            if cause:
+                self.ack_cause = cause
+            if note:
+                self.ack_note = note
+            self.add_timeline_entry(
+                "ACKNOWLEDGED", operator,
+                details=" · ".join(x for x in (issue_type, cause, note) if x) or None,
+            )
             return True
         return False
 
     def investigate(self, operator, notes=None):
-        if self.status in ("OPEN", "ACKNOWLEDGED"):
+        if self.status in ("OPEN", "ACKNOWLEDGED", "DETECTED", "CONFIRMED", "ASSIGNED"):
             self.status = "INVESTIGATING"
             if notes:
                 self.investigation_notes.append({
@@ -245,10 +322,19 @@ class Incident:
         return False
 
     def resolve(self, operator, notes=None):
-        if self.status in ("OPEN", "ACKNOWLEDGED", "INVESTIGATING"):
+        if self.status in ("OPEN", "ACKNOWLEDGED", "INVESTIGATING",
+                           "DETECTED", "CONFIRMED", "ASSIGNED", "RESPONDING"):
             self.status = "RESOLVED"
             self.resolved_by = operator
             self.resolved_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            # Calculate resolution time
+            if self.created_at:
+                try:
+                    created = datetime.fromisoformat(self.created_at.replace("Z", "+00:00"))
+                    resolved = datetime.fromisoformat(self.resolved_at.replace("Z", "+00:00"))
+                    self.resolution_time_seconds = (resolved - created).total_seconds()
+                except (ValueError, TypeError):
+                    pass
             if notes:
                 self.investigation_notes.append({
                     "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -267,6 +353,80 @@ class Incident:
             return True
         return False
 
+    # --- Extended lifecycle methods ---
+
+    def confirm(self, operator):
+        """DETECTED -> CONFIRMED: Operator verifies the incident is real."""
+        if self.status == "DETECTED":
+            self.status = "CONFIRMED"
+            self.confirmed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self.add_timeline_entry("CONFIRMED", operator)
+            return True
+        return False
+
+    def assign(self, operator, assignee):
+        """CONFIRMED -> ASSIGNED: Assign to a specific operator for response."""
+        if self.status in ("CONFIRMED", "OPEN", "DETECTED"):
+            self.status = "ASSIGNED"
+            self.assigned_to = assignee
+            self.assigned_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self.add_timeline_entry("ASSIGNED", operator, f"Assigned to {assignee}")
+            return True
+        return False
+
+    def start_responding(self, operator):
+        """ASSIGNED -> RESPONDING: Operator begins active response."""
+        if self.status in ("ASSIGNED", "CONFIRMED", "OPEN"):
+            self.status = "RESPONDING"
+            self.responding_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            # Calculate response time
+            if self.assigned_at:
+                try:
+                    assigned = datetime.fromisoformat(self.assigned_at.replace("Z", "+00:00"))
+                    responding = datetime.fromisoformat(self.responding_at.replace("Z", "+00:00"))
+                    self.response_time_seconds = (responding - assigned).total_seconds()
+                except (ValueError, TypeError):
+                    pass
+            elif self.created_at:
+                try:
+                    created = datetime.fromisoformat(self.created_at.replace("Z", "+00:00"))
+                    responding = datetime.fromisoformat(self.responding_at.replace("Z", "+00:00"))
+                    self.response_time_seconds = (responding - created).total_seconds()
+                except (ValueError, TypeError):
+                    pass
+            self.add_timeline_entry("RESPONDING", operator)
+            return True
+        return False
+
+    def reject(self, operator):
+        """ASSIGNED -> CONFIRMED: operator declines the work so the auto-assigner routes it onward."""
+        if self.status == "ASSIGNED":
+            self.status = "CONFIRMED"
+            if operator and operator not in self.rejected_by:
+                self.rejected_by.append(operator)
+            self.add_timeline_entry("REJECTED", operator, f"Declined by {operator}; re-routing")
+            return True
+        return False
+
+    def auto_reassign(self, assignee, attempt, escalated=False, actor="system"):
+        """Route (or re-route) critical work to an operator. Always lands on ASSIGNED."""
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        if self.status == "DETECTED":
+            self.status = "CONFIRMED"
+            self.confirmed_at = now
+            self.add_timeline_entry("CONFIRMED", actor, "Auto-confirmed for routing")
+        self.status = "ASSIGNED"
+        self.assigned_to = assignee
+        self.assigned_at = now
+        self.last_assigned_at = now
+        self.auto_assigned = True
+        self.assign_attempts = attempt
+        if escalated:
+            self.escalation_level += 1
+        action = "ESCALATED" if escalated and attempt > 1 else "AUTO_ASSIGNED"
+        self.add_timeline_entry(action, actor, f"Routed to {assignee} (attempt {attempt})")
+        return True
+
 
 # ---------------------------------------------------------------------------
 # Incident store (in-memory + persistence)
@@ -281,6 +441,14 @@ class IncidentStore:
         self._bus_incidents = {}  # bus_id -> set of incident_ids
         self._event_incidents = {}  # event_id -> incident_id
         self._last_created = {}  # (bus_id, category) -> timestamp
+
+    def clear(self):
+        """Empty the store (used by tests / full resets)."""
+        with self._lock:
+            self._incidents.clear()
+            self._bus_incidents.clear()
+            self._event_incidents.clear()
+            self._last_created.clear()
 
     def get_incident(self, incident_id):
         with self._lock:
@@ -308,7 +476,11 @@ class IncidentStore:
         return items[:limit]
 
     def get_active_incidents(self):
-        return self.get_incidents(status="OPEN")
+        return self.get_incidents(status="DETECTED") + self.get_incidents(status="OPEN")
+
+    def get_assigned_incidents(self):
+        """Work waiting on an operator: ASSIGNED (action needed) + RESPONDING (in progress)."""
+        return self.get_incidents(status="ASSIGNED") + self.get_incidents(status="RESPONDING")
 
     def get_incidents_for_bus(self, bus_id):
         with self._lock:
@@ -343,9 +515,9 @@ class IncidentStore:
     def _update_incident(self, incident):
         persistence.save_incident(incident.to_dict())
 
-    def acknowledge_incident(self, incident_id, operator):
+    def acknowledge_incident(self, incident_id, operator, issue_type=None, cause=None, note=None):
         incident = self.get_incident(incident_id)
-        if incident and incident.acknowledge(operator):
+        if incident and incident.acknowledge(operator, issue_type=issue_type, cause=cause, note=note):
             self._update_incident(incident)
             return incident
         return None
@@ -371,6 +543,40 @@ class IncidentStore:
             return incident
         return None
 
+    def confirm_incident(self, incident_id, operator):
+        """Confirm an incident is real (DETECTED -> CONFIRMED)."""
+        incident = self.get_incident(incident_id)
+        if incident and incident.confirm(operator):
+            self._update_incident(incident)
+            return incident
+        return None
+
+    def assign_incident(self, incident_id, operator, assignee):
+        """Assign an incident's work to a specific operator (CONFIRMED/OPEN/DETECTED -> ASSIGNED)."""
+        if not assignee or not str(assignee).strip():
+            return None
+        incident = self.get_incident(incident_id)
+        if incident and incident.assign(operator, str(assignee).strip()):
+            self._update_incident(incident)
+            return incident
+        return None
+
+    def respond_incident(self, incident_id, operator):
+        """Operator begins active response on assigned work (ASSIGNED/CONFIRMED/OPEN -> RESPONDING)."""
+        incident = self.get_incident(incident_id)
+        if incident and incident.start_responding(operator):
+            self._update_incident(incident)
+            return incident
+        return None
+
+    def reject_incident(self, incident_id, operator):
+        """Operator declines assigned work (ASSIGNED -> CONFIRMED); caller re-routes it."""
+        incident = self.get_incident(incident_id)
+        if incident and incident.reject(operator):
+            self._update_incident(incident)
+            return incident
+        return None
+
     def _check_dedup(self, bus_id, category):
         """Check if we should deduplicate (update existing incident)."""
         now = time.time()
@@ -378,10 +584,13 @@ class IncidentStore:
         with self._lock:
             last = self._last_created.get(key, 0)
         if now - last < DEDUP_WINDOW_S:
-            # Find the most recent incident for this bus/category
-            incidents = self.get_incidents(bus_id=bus_id, category=category, status="OPEN", limit=1)
-            if incidents:
-                return incidents[0]
+            # Most recent actionable incident for this bus/category — assigned
+            # work stays deduplicable so follow-up events join the operator's
+            # incident instead of spawning duplicates.
+            for status in ("DETECTED", "OPEN", "CONFIRMED", "ASSIGNED", "RESPONDING"):
+                incidents = self.get_incidents(bus_id=bus_id, category=category, status=status, limit=1)
+                if incidents:
+                    return incidents[0]
         return None
 
     def _check_correlation(self, bus_id, category, event_timestamp):
@@ -392,8 +601,11 @@ class IncidentStore:
         except (ValueError, TypeError):
             event_time = now
 
-        # Find open incidents for this bus/category within correlation window
-        incidents = self.get_incidents(bus_id=bus_id, category=category, status="OPEN", limit=5)
+        # Actionable incidents for this bus/category within the window —
+        # assigned work stays correlatable so related events join it.
+        incidents = []
+        for status in ("DETECTED", "OPEN", "CONFIRMED", "ASSIGNED", "RESPONDING"):
+            incidents.extend(self.get_incidents(bus_id=bus_id, category=category, status=status, limit=5))
         for inc in incidents:
             try:
                 inc_time = datetime.fromisoformat(inc.created_at.replace("Z", "+00:00")).timestamp()
@@ -548,6 +760,126 @@ def _classify_data_source(event, bus=None):
 # Public API: process event into incident
 # ---------------------------------------------------------------------------
 
+def get_duty_roster():
+    """Roster of operators who can receive auto-assigned work, from registered users.
+
+    Returns (operators, supervisors): active usernames sorted for stable
+    round-robin order. Empty lists when no users are registered.
+    """
+    operators, supervisors = [], []
+    try:
+        from auth import list_users
+        for u in list_users() or []:
+            if not u.get("active", True):
+                continue
+            name = u.get("username")
+            if not name:
+                continue
+            if u.get("role") == "operator":
+                operators.append(name)
+            elif u.get("role") in ("supervisor", "admin"):
+                supervisors.append(name)
+    except Exception as e:
+        print(f"[incident-intelligence] Roster lookup failed: {e}")
+    return sorted(operators), sorted(supervisors)
+
+
+def _pick_assignee(incident, operators, supervisors):
+    """Next assignee: round-robin over operators, skipping those who rejected.
+
+    Falls back to supervisors, then to any name already on the incident, then
+    to a generic duty operator (single-user installs land here and re-alert).
+    """
+    tried = set(incident.rejected_by or [])
+    if incident.assigned_to:
+        tried.add(incident.assigned_to)
+    fresh = [o for o in operators if o not in tried]
+    pool = fresh or [o for o in operators if o != incident.assigned_to]
+    if pool:
+        idx = (incident.assign_attempts) % len(pool)
+        return pool[idx], False
+    sup_pool = [s for s in supervisors if s not in (incident.rejected_by or [])]
+    if sup_pool:
+        return sup_pool[0], True
+    if incident.assigned_to:
+        return incident.assigned_to, False
+    return "duty-operator", False
+
+
+def auto_assign_incident(incident, actor="system"):
+    """Route a critical incident to an operator (first or next attempt).
+
+    Confirms DETECTED incidents, assigns, persists, and returns the incident.
+    """
+    operators, supervisors = get_duty_roster()
+    if not operators and supervisors:
+        operators = list(supervisors)
+    assignee, _to_supervisor = _pick_assignee(incident, operators, supervisors)
+    attempt = (incident.assign_attempts or 0) + 1
+    incident.auto_reassign(assignee, attempt, escalated=(attempt > 1), actor=actor)
+    incident_store._update_incident(incident)
+    print(f"[incident-intelligence] Auto-assigned {incident.incident_id} "
+          f"({incident.severity}) to {assignee} (attempt {attempt})")
+    return incident
+
+
+def maybe_auto_assign(incident):
+    """Auto-assign hook: only CRITICAL, unassigned, actionable incidents."""
+    if incident.severity not in AUTO_ASSIGN_SEVERITIES:
+        return False
+    if incident.status in ("ASSIGNED", "RESPONDING", "RESOLVED", "CLOSED"):
+        return False
+    if incident.status not in ("DETECTED", "CONFIRMED", "OPEN"):
+        return False
+    auto_assign_incident(incident)
+    return True
+
+
+def process_assignment_timeouts(now=None):
+    """Re-route ASSIGNED work nobody responded to; escalate to supervisor.
+
+    Called every second by the server monitor thread. Returns the list of
+    incident_ids that were re-routed (each needs a fresh popup + sound).
+    """
+    now_ts = now if now is not None else time.time()
+    timeout = _auto_assign_timeout_sec()
+    max_attempts = _auto_assign_max_attempts()
+    operators, supervisors = get_duty_roster()
+    if not operators and supervisors:
+        operators = list(supervisors)
+    rerouted = []
+    for incident in incident_store.get_incidents(limit=1000):
+        if incident.status != "ASSIGNED" or not incident.auto_assigned:
+            continue
+        try:
+            last = datetime.fromisoformat(
+                (incident.last_assigned_at or incident.assigned_at or "").replace("Z", "+00:00"))
+            age = now_ts - last.timestamp()
+        except (ValueError, TypeError):
+            continue
+        if age < timeout:
+            continue
+        attempt = (incident.assign_attempts or 0) + 1
+        if attempt > max_attempts:
+            sup_pool = [s for s in supervisors
+                        if s not in (incident.rejected_by or [])] or supervisors
+            if sup_pool:
+                incident.auto_reassign(sup_pool[0], attempt, escalated=True, actor="system")
+                incident.add_timeline_entry(
+                    "ESCALATED_TO_SUPERVISOR", "system",
+                    f"No response after {max_attempts} attempts; escalated to {sup_pool[0]}")
+                incident_store._update_incident(incident)
+                rerouted.append(incident.incident_id)
+            continue
+        assignee, _ = _pick_assignee(incident, operators, supervisors)
+        incident.auto_reassign(assignee, attempt, escalated=True, actor="system")
+        incident_store._update_incident(incident)
+        rerouted.append(incident.incident_id)
+        print(f"[incident-intelligence] No response on {incident.incident_id}; "
+              f"re-routed to {assignee} (attempt {attempt})")
+    return rerouted
+
+
 def process_event(event, bus=None, risk_info=None):
     """Process an event and potentially create/update an incident.
 
@@ -592,6 +924,7 @@ def process_event(event, bus=None, risk_info=None):
                                                  risk_info.get("risk_level") if risk_info else None)
         existing.add_timeline_entry("EVENT_ADDED", details=f"Event {event_id} added")
         incident_store._update_incident(existing)
+        maybe_auto_assign(existing)
         return {"action": "deduplicated", "incident": existing,
                 "reason": f"Event {event_id} added to existing incident {existing.incident_id}"}
 
@@ -611,6 +944,7 @@ def process_event(event, bus=None, risk_info=None):
                                                    risk_info.get("risk_level") if risk_info else None)
         correlated.add_timeline_entry("EVENT_CORRELATED", details=f"Event {event_id} correlated")
         incident_store._update_incident(correlated)
+        maybe_auto_assign(correlated)
         return {"action": "updated", "incident": correlated,
                 "reason": f"Event {event_id} correlated with incident {correlated.incident_id}"}
 
@@ -642,6 +976,7 @@ def process_event(event, bus=None, risk_info=None):
     incident.add_timeline_entry("CREATED", details=f"Incident created from event {event_id}")
 
     incident_store._add_incident(incident)
+    maybe_auto_assign(incident)
     return {"action": "created", "incident": incident,
             "reason": f"New incident {incident.incident_id} created from event {event_id}"}
 
@@ -726,6 +1061,127 @@ def get_bus_incidents(bus_id, limit=20):
 
 
 # ---------------------------------------------------------------------------
+# Demo incident rotation (temporary demo behaviour — only for now)
+# ---------------------------------------------------------------------------
+# Keeps the incident workflow to a small, always-changing set so a demo shows
+# ~5 incidents that cycle every two minutes: old ones rotate out (resolved),
+# fresh random incidents come in, and acknowledged ones stay counted.
+# Disable with FLEETIQ_DEMO_INCIDENT_ROTATION=0.
+
+def _demo_rotation_enabled():
+    return os.environ.get("FLEETIQ_DEMO_INCIDENT_ROTATION", "1").strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
+def _demo_max_active_incidents():
+    try:
+        return max(1, int(os.environ.get("FLEETIQ_DEMO_MAX_ACTIVE_INCIDENTS", "5")))
+    except (TypeError, ValueError):
+        return 5
+
+
+def _demo_rotation_sec():
+    try:
+        return max(30, float(os.environ.get("FLEETIQ_DEMO_ROTATION_SEC", "120")))
+    except (TypeError, ValueError):
+        return 120.0
+
+
+_DEMO_TRIGGERS = sorted(k for k in INCIDENT_TRIGGER_TYPES if k != "BUS_OFFLINE")
+
+
+def _random_bus_pool():
+    try:
+        from data_store import store
+        return store.get_buses()
+    except Exception:
+        return []
+
+
+def create_random_demo_incident():
+    """Create a fresh simulated incident through the normal pipeline.
+
+    Picks a random bus and trigger type, feeds a synthetic SIMULATION event
+    through process_event so title/severity/category/auto-assign behave
+    exactly like any other incident.
+    """
+    buses = _random_bus_pool()
+    if not buses:
+        return None
+    bus = random.choice(buses)
+    trigger = random.choice(_DEMO_TRIGGERS)
+    severity = random.choice(["CRITICAL", "HIGH", "WARNING", "INFO"])
+    event = {
+        "event_id": f"DEMO-{uuid.uuid4().hex[:10].upper()}",
+        "event_type": trigger,
+        "bus_id": bus.get("bus_id"),
+        "severity": severity,
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "simulation": True,
+        "sensor_source": "simulator",
+        "confidence": round(random.uniform(0.6, 0.98), 2),
+        "additional_data": {"note": "Demo rotation incident"},
+    }
+    return process_event(event, bus=bus).get("incident")
+
+
+def rotate_demo_incidents(max_active=None, swap=2, operator="system"):
+    """Demo rotation: cap the actionable set and keep it changing.
+
+    Actionable incidents (anything not RESOLVED/CLOSED/ACKNOWLEDGED) are
+    trimmed to `max_active` (oldest surplus resolved as "Rotated out"), then
+    `swap` random survivors are also cycled out and fresh random incidents are
+    created so the page always shows ~5 incidents that change every cycle (old
+    ones go, new ones come). Acknowledged incidents are preserved so the
+    acknowledged counter stays meaningful. Returns a small stats dict.
+    """
+    max_active = max_active or _demo_max_active_incidents()
+    incidents = incident_store.get_incidents(limit=10000)
+    actionable = [i for i in incidents
+                  if i.status not in ("RESOLVED", "CLOSED", "ACKNOWLEDGED")]
+    actionable.sort(key=lambda i: i.created_at or "")
+    surplus = actionable[:-max_active] if len(actionable) > max_active else []
+    for inc in surplus:
+        try:
+            inc.resolve(operator, notes="Rotated out (demo) — only a handful of incidents shown")
+            incident_store._update_incident(inc)
+        except Exception:
+            pass
+
+    # Actively cycle a random subset so the demo visibly changes every cycle.
+    swapped_out = []
+    survivors = [i for i in actionable if i not in surplus]
+    if swap > 0 and survivors:
+        swapped_out = random.sample(survivors, min(swap, len(survivors)))
+        for inc in swapped_out:
+            try:
+                inc.resolve(operator, notes="Rotated out (demo) — fresh incidents coming in")
+                incident_store._update_incident(inc)
+            except Exception:
+                pass
+
+    made = 0
+    live = [i for i in incident_store.get_incidents(limit=10000)
+            if i.status not in ("RESOLVED", "CLOSED")]
+    while len(live) < max_active and made < max_active:
+        created = create_random_demo_incident()
+        if created is None:
+            break
+        made += 1
+        live = [i for i in incident_store.get_incidents(limit=10000)
+                if i.status not in ("RESOLVED", "CLOSED")]
+
+    acked = len(incident_store.get_incidents(status="ACKNOWLEDGED"))
+    return {
+        "rotated": len(surplus) + len(swapped_out),
+        "created": made,
+        "active": len([i for i in incident_store.get_incidents(limit=10000)
+                       if i.status not in ("RESOLVED", "CLOSED")]),
+        "acknowledged": acked,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Loading from persistence on startup
 # ---------------------------------------------------------------------------
 
@@ -760,6 +1216,17 @@ def load_incidents_from_persistence():
                 resolved_at=inc_data.get("resolved_at"),
                 investigation_notes=inc_data.get("investigation_notes", []),
                 timeline=inc_data.get("timeline", []),
+                assigned_to=inc_data.get("assigned_to"),
+                assigned_at=inc_data.get("assigned_at"),
+                responding_at=inc_data.get("responding_at"),
+                confirmed_at=inc_data.get("confirmed_at"),
+                response_time_seconds=inc_data.get("response_time_seconds"),
+                resolution_time_seconds=inc_data.get("resolution_time_seconds"),
+                auto_assigned=inc_data.get("auto_assigned", False),
+                assign_attempts=inc_data.get("assign_attempts", 0),
+                rejected_by=inc_data.get("rejected_by", []),
+                escalation_level=inc_data.get("escalation_level", 0),
+                last_assigned_at=inc_data.get("last_assigned_at"),
             )
             incident_store._add_incident.__func__(incident_store, inc)
             loaded += 1

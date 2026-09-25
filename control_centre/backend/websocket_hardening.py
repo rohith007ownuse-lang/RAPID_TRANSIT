@@ -668,7 +668,7 @@ class ReconnectionManager:
         self._attempt = 0
         self._last_attempt = None
         self._consecutive_failures = 0
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def should_reconnect(self) -> bool:
         """Check if reconnection should be attempted."""

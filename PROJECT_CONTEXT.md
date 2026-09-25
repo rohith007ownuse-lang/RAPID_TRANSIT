@@ -1,4 +1,4 @@
-# AI Urban Intelligence Platform — Consolidated Project Context
+# Rapid Transit — Consolidated Project Context
 
 > Single-file reference for AI agents. Read this file to understand the entire project.
 
@@ -25,7 +25,7 @@ Each bus collects: driver safety (drowsiness, distraction), cabin safety, road c
 | Frontend | React 19 + Vite, React Router, react-leaflet (OpenStreetMap tiles), Recharts, custom dark-blue theme CSS |
 | Backend | Python Flask REST API + in-memory thread-safe data_store |
 | WebSocket | `ws://127.0.0.1:8765` — bus-node → Control Centre ingestion |
-| Fleet Simulation | `FleetSimulator` background thread: 100 buses, 14 Chennai MTC routes, 1s tick |
+| Fleet Simulation | `FleetSimulator` background thread: 300 vehicles, curated Chennai MTC corridors (GTFS), 1s tick |
 | AI Perception | MediaPipe FaceLandmarker, YOLO (yolov8n.pt), Haar cascade fallback |
 | Camera | OpenCV (cv2.VideoCapture), single webcam routed to one AI module at a time |
 
@@ -71,9 +71,8 @@ PYTHONUNBUFFERED=1 setsid venv/bin/python server.py --start-mode live </dev/null
                     │  server.py  ·  data_store.py (in-memory)     │
                     └───────────────▲────────────────────────────┘
                                     │ upsert / query
-                    ┌───────────────┴────────────────────────────┐
-                    │  FleetSimulator (simulator.py, thread)      │
-                    │  100 buses · 14 MTC routes · 1 s tick        │
+                    ┌───────────────┴────────────────────────────┐  │  FleetSimulator (simulator.py, thread)      │
+  │  300 vehicles · MTC corridors · 1 s tick     │
                     └─────────────────────────────────────────────┘
 
   Real bus nodes (bus_node hardware, later phase)
@@ -91,7 +90,7 @@ bus_node (real or simulated) ──WebSocket :8765──► Control Centre backe
 ```
 
 ### Modes
-- **SIMULATION mode**: `FleetSimulator` thread ticks 1×/s, 100 buses, events, potholes, ticketing, fatigue episodes, health.
+- **SIMULATION mode**: `FleetSimulator` thread ticks 1×/s, 300 vehicles, events, potholes, ticketing, fatigue episodes, health.
 - **LIVE mode**: simulator stopped, store cleared, webcam AI runs; a stub `PROTO-001` bus represents the live prototype; camera frames + detections served as base64 JPEG over REST.
 
 ---
@@ -99,7 +98,7 @@ bus_node (real or simulated) ──WebSocket :8765──► Control Centre backe
 ## 5. PROJECT DIRECTORY STRUCTURE
 
 ```
-AI_Urban_Intelligence_Platform/
+Rapid-Tracker/
 ├── PLAN.md                           ← Architecture, flow diagrams, phases
 ├── README.md                         ← Status table, run instructions
 ├── URBAN_INTELLIGENCE_OVERVIEW.md    ← Deep system overview
@@ -164,7 +163,8 @@ AI_Urban_Intelligence_Platform/
 ## 6. DOMAIN MODEL
 
 ### 6.1 Fleet
-- **100 buses** across **14 MTC corridors** (7–8 services per route), e.g. `1A`, `19D`; second service on same route is `1A .2`.
+- **300 vehicles** across a curated set of MTC corridors (GTFS-derived; e.g. `1A`, `19D`; second service on same route is `1A .2`). `/api/buses/<id>` links use URL-encoding because ids contain a space.
+- **Error budget**: only ~10 vehicles misbehave — 5 driver-attention (`_prone`) + 5 vehicle-attention (`_attention`) services. The other 290 stay healthy: transient blips self-heal and predictive-health counters decay to baseline (see `predictive_health.generate_health_events` gate).
 - Each bus carries: Identity (bus_id, route_code, route, reg_no), Vehicle type (EV battery% or DIESEL fuel%), Position & motion (lat/lon, speed_kmh, journey state), Driver (state NORMAL/ATTENTION/DROWSY, name, gaze metrics EAR/MAR/pitch/closed_sec), Occupancy/load (0–60 passengers, pct, crowd level, GVW), Energy (kWh or litres), Wheels (4-tyre PSI), Vehicle health (NORMAL/WARNING/INSPECTION REQUIRED, vibration, braking_events, maintenance_priority), Ticketing (tickets_today, fare_collected ₹, avg fare ₹18.5).
 
 ### 6.2 Routes & Journeys
@@ -431,7 +431,7 @@ Defect clustering → risk zones (0–100 score, levels) + per-route risk index 
 | Audio alert tones | **IMPLEMENTED** |
 | Event logging | **IMPLEMENTED** |
 | Control Centre web UI (map + live fleet) | **IMPLEMENTED** (simulated data, clearly labeled) |
-| 100-bus Chennai MTC fleet simulator | **IMPLEMENTED** (simulated data) |
+| 300-vehicle Chennai MTC fleet simulator | **IMPLEMENTED** (simulated data, 10-vehicle error budget) |
 | Per-bus ticket machine counters | **IMPLEMENTED** (simulated MTC ticket-machine data) |
 | Operator Intercom | **IMPLEMENTED** (in-app call store; simulated) |
 | Risk engine / AI actions / scenarios / predictive health / ETA / demand / road risk | **IMPLEMENTED** (simulated) |
@@ -462,9 +462,12 @@ Defect clustering → risk zones (0–100 score, levels) + per-route risk index 
 ## 17. SOUND SYSTEM STATUS (IMPORTANT)
 
 Sound is **OFF** until the user says "sound on" (disabled per user request, Sep 7, 2026).
-- The DDS drowsiness alarm lives in `bus_node/utils/alert_manager.py` and loops `tone_critical.wav`/`tone_warning.wav` via `aplay` whenever live monitoring hits CRITICAL/WARNING. Alarm loops can ORPHAN and keep playing forever if the parent process dies before `stop()` — exactly what happened (≈50 zombie `aplay` loops, all killed).
-- Kill-switches to re-enable:
-  - `bus_node/utils/alert_manager.py` → `AlertManager.muted` (currently `True`). When muted, `update()` never starts a loop, `_silence_stray_loops()` (run at construction) kills leftover `aplay` loops, and `POST /api/dds/subprocess/start` refuses to launch the original DDS app (it plays its own alarm audio).
+- The DDS drowsiness alarm lives in `bus_node/utils/alert_manager.py` and loops `tone_critical.wav`/`tone_warning.wav` via `aplay` whenever monitoring hits CRITICAL/WARNING. Alarm loops ORPHANED in the past (≈50 zombie `aplay` loops) — **fixed Sep 13, 2026** with a 3-layer defense:
+  1. `feature_toggles.json` → `audio_alerts: false` (default OFF, matches the standing user decision); `update()` refuses to start sound while it is false.
+  2. `_silence_stray_loops()` runs at EVERY `AlertManager` construction (not only when muted) — any leftover `aplay` loop on our tones is killed before a new one can start; a daemon watchdog re-sweeps every 15 s.
+  3. `stop()` kills the alarm's whole process group (bash loop + `aplay` child, SIGTERM then SIGKILL, own session via `start_new_session=True`) — a parent dying can no longer leave a playing loop behind.
+- Kill-switches to re-enable sound deliberately:
+  - Feature Toggles page (or `feature_toggles.json`) → `audio_alerts: true` (AlertManager unmutes via runtime toggle).
   - `control_centre/frontend/src/pages/CallCenter.jsx` → `SOUND_ENABLED` (currently `false`) gates the Web-Speech TTS `say()`.
 
 ---

@@ -50,11 +50,12 @@ RISK_TRENDS = ("INCREASING", "STABLE", "DECREASING", "UNKNOWN")
 _TRANSITION_DEBOUNCE_S = 30.0
 _TRANSITION_HYSTERESIS = 5.0  # score change required to trigger transition
 
-# Risk state thresholds
+# Risk state thresholds — HIGH starts at 60 so the "high risk" tier stays
+# focused on the buses actually worth operator attention (60–70+ band).
 _RISK_THRESHOLDS = {
     "LOW": (0, 30),
-    "MODERATE": (30, 55),
-    "HIGH": (55, 80),
+    "MODERATE": (30, 60),
+    "HIGH": (60, 80),
     "CRITICAL": (80, 100),
 }
 
@@ -62,7 +63,7 @@ _RISK_THRESHOLDS = {
 def level_for_score(score):
     if score >= 80:
         return "CRITICAL"
-    if score >= 55:
+    if score >= 60:
         return "HIGH"
     if score >= 30:
         return "MODERATE"
@@ -309,7 +310,7 @@ def _score_driver(d, detection):
     # Determine state
     if score >= 80:
         factor_state = "CRITICAL"
-    elif score >= 55:
+    elif score >= 60:
         factor_state = "HIGH"
     elif score >= 30:
         factor_state = "MODERATE"
@@ -389,7 +390,7 @@ def _score_vehicle(vehicle, energy, wheels, tyre_target):
     # Determine state
     if score >= 80:
         factor_state = "CRITICAL"
-    elif score >= 55:
+    elif score >= 60:
         factor_state = "HIGH"
     elif score >= 30:
         factor_state = "MODERATE"
@@ -446,7 +447,7 @@ def _score_load(load):
     # Determine state
     if score >= 80:
         factor_state = "CRITICAL"
-    elif score >= 55:
+    elif score >= 60:
         factor_state = "HIGH"
     elif score >= 30:
         factor_state = "MODERATE"
@@ -505,7 +506,7 @@ def _score_speed(speed_kmh):
     # Determine state
     if score >= 80:
         factor_state = "CRITICAL"
-    elif score >= 55:
+    elif score >= 60:
         factor_state = "HIGH"
     elif score >= 30:
         factor_state = "MODERATE"
@@ -561,7 +562,7 @@ def _score_occupancy(occupancy):
     # Determine state
     if score >= 80:
         factor_state = "CRITICAL"
-    elif score >= 55:
+    elif score >= 60:
         factor_state = "HIGH"
     elif score >= 30:
         factor_state = "MODERATE"
@@ -630,7 +631,7 @@ def _score_history(active_events, road_exposure=None):
     # Determine state
     if score >= 80:
         factor_state = "CRITICAL"
-    elif score >= 55:
+    elif score >= 60:
         factor_state = "HIGH"
     elif score >= 30:
         factor_state = "MODERATE"
@@ -810,7 +811,7 @@ def recommended_actions(bus, segments):
     if float((bus.get("occupancy") or {}).get("pct", 0)) >= 90:
         actions.append("Consider relief bus to ease crowding")
 
-    if segments.get("history", {}).get("score", 0) >= 55:
+    if segments.get("history", {}).get("score", 0) >= 60:
         actions.append("Prioritise review of recent incidents for this bus")
 
     # Road-related recommendations (contextual, not causal)

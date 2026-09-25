@@ -29,7 +29,7 @@ export function StatusBadge({ status }) {
 
 export function riskTone(level) {
   if (level === 'CRITICAL' || level === 'HIGH') return 'var(--red)'
-  if (level === 'MEDIUM') return 'var(--amber)'
+  if (level === 'MEDIUM' || level === 'WARNING' || level === 'AMBER') return 'var(--amber)'
   return 'var(--green)'
 }
 
@@ -76,6 +76,14 @@ export function StatCard({ label, value, icon, tone = 'blue', hint }) {
       <div className="stat-label" style={{ marginTop: 8 }}>{label}</div>
       <div className="stat-value">{value}</div>
       {hint && <div className="muted" style={{ fontSize: 12, marginTop: 2 }}>{hint}</div>}
+    </div>
+  )
+}
+
+export function BrandLogo({ size = 34 }) {
+  return (
+    <div className="rt-logo" style={{ width: size, height: size }}>
+      <span style={{ fontSize: Math.round(size * 0.56), letterSpacing: '-0.02em' }}>R</span>
     </div>
   )
 }

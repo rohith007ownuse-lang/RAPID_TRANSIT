@@ -116,6 +116,17 @@ class EventStore:
         # road-defect key -> defect dict (grouped persistent defects)
         self.road_defects = OrderedDict()
 
+        # bus_id -> maintenance review record. A vehicle that enters the
+        # "needs maintenance" list STAYS there until an operator reviews it
+        # (review-to-clear) — it must not vanish just because its counters
+        # decayed back under threshold on a later tick.
+        self.maintenance_reviews = OrderedDict()
+
+        # bus_id -> first-flag snapshot. Remembers every vehicle that EVER
+        # entered the needs-maintenance list, so a bus cannot drop off the
+        # list by transient counter decay — only an operator review clears it.
+        self.maintenance_flagged = OrderedDict()
+
     def upsert_bus(self, bus):
         with self._lock:
             self.buses[bus["bus_id"]] = bus
@@ -128,7 +139,27 @@ class EventStore:
         with self._lock:
             return list(self.buses.values())
 
+    def load_events_bulk(self, events):
+        """Bulk-load already-persisted events straight into memory.
+
+        Used at startup to re-hydrate the in-memory log from SQLite without
+        re-writing every row (they are the source of truth and already
+        persisted) and without re-running the alert pipeline. This avoids
+        the O(n) reconnect+INSERT+commit cost of replaying each event
+        through add_event().
+        """
+        with self._lock:
+            for event in events:
+                event_id = event.get("event_id") or str(uuid.uuid4())[:13]
+                self.events[event_id] = dict(event)
+
     def add_event(self, event):
+        """Add an event to the store.
+
+        Phase 19: Enhanced with health tracking and failure isolation.
+        Persistence failures are now caught and logged without breaking
+        the event pipeline.
+        """
         event_id = event.get("event_id") or str(uuid.uuid4())[:13]
         event = dict(event)
         event["event_id"] = event_id
@@ -136,10 +167,29 @@ class EventStore:
         event.setdefault("status", "ACTIVE")
         with self._lock:
             self.events[event_id] = event
+        # Phase 16: correlate the raw event into an operational INCIDENT so
+        # the Incident Management workflow (Not finished / Resolved / Total)
+        # reflects what actually happens — previously incidents were only
+        # created when operators acknowledged, so the counters stayed 0/0/0.
+        try:
+            from incident_intelligence import process_event as incident_process_event
+            incident_process_event(event, bus=self.buses.get(event.get("bus_id")))
+        except Exception:
+            pass  # incident correlation must never break the event pipeline
         # Persistence first (the event is the source of truth), then the
         # Phase-9 real-time alert decision. The alert step is failure-isolated:
         # no broadcast problem can ever break event creation.
-        persistence.save_event(event)
+        # Phase 19: Persistence failure is now caught and logged
+        try:
+            persistence.save_event(event)
+        except Exception as exc:
+            # Phase 19: Persistence failure is non-blocking but observable
+            print(f"[data-store] persistence error (event kept in memory): {exc}")
+            try:
+                from system_health import record_subsystem_failure
+                record_subsystem_failure("persistence", str(exc), critical=False)
+            except ImportError:
+                pass
         try:
             bus_snapshot = self.buses.get(event.get("bus_id"))
             alerts.process_event(event, bus=bus_snapshot)
@@ -244,6 +294,60 @@ class EventStore:
     def get_road_defects(self):
         with self._lock:
             return list(self.road_defects.values())
+
+    # ---- Maintenance reviews (review-to-clear for Vehicle Health) ----
+    def review_maintenance(self, bus_id, operator=None, note=None):
+        """Mark a vehicle's maintenance entry reviewed (clears it from the list)."""
+        with self._lock:
+            record = {
+                "bus_id": bus_id,
+                "reviewed_by": operator or "operator",
+                "reviewed_at": utcnow_iso(),
+                "note": note or "",
+            }
+            self.maintenance_reviews[bus_id] = record
+            return record
+
+    def unreview_maintenance(self, bus_id):
+        """Re-open a maintenance entry (e.g. fault re-appears)."""
+        with self._lock:
+            return self.maintenance_reviews.pop(bus_id, None)
+
+    def get_maintenance_reviews(self):
+        with self._lock:
+            return dict(self.maintenance_reviews)
+
+    def is_maintenance_reviewed(self, bus_id):
+        with self._lock:
+            return bus_id in self.maintenance_reviews
+
+    def flag_maintenance(self, bus_id, days=None, status=None):
+        """Remember that a bus entered the needs-maintenance list."""
+        with self._lock:
+            existing = self.maintenance_flagged.get(bus_id)
+            if existing:
+                existing["last_days"] = days
+                existing["last_status"] = status
+                existing["last_seen"] = utcnow_iso()
+                return existing
+            record = {
+                "bus_id": bus_id,
+                "first_flagged_at": utcnow_iso(),
+                "last_seen": utcnow_iso(),
+                "last_days": days,
+                "last_status": status,
+            }
+            self.maintenance_flagged[bus_id] = record
+            return record
+
+    def get_maintenance_flagged(self):
+        with self._lock:
+            return dict(self.maintenance_flagged)
+
+    def clear_maintenance_flag(self, bus_id):
+        """Drop the sticky flag (called together with a review)."""
+        with self._lock:
+            return self.maintenance_flagged.pop(bus_id, None)
 
     # ---- Settings / config (editable from the UI) ----
     def get_settings(self):

@@ -62,10 +62,10 @@ export default function Settings() {
             <div className="card-header"><h3 className="card-title">System</h3></div>
             <table className="table">
               <tbody>
-                <tr><td>Simulation mode</td><td><span className="badge badge-indigo">ON — demo data</span></td></tr>
+                <tr><td>Demo mode</td><td><span className="badge badge-indigo">ON — demo data</span></td></tr>
                 <tr><td>City</td><td>{data.city?.name} ({data.city?.country})</td></tr>
                 <tr><td>Map centre</td><td className="mono">{data.city?.map_center?.join(', ')}</td></tr>
-                <tr><td>Data source</td><td className="muted">simulated fleet; real bus-node link planned</td></tr>
+                <tr><td>Data source</td><td className="muted">estimated fleet; real bus-node link planned</td></tr>
                 <tr><td>Backend</td><td className="mono">Flask REST API</td></tr>
               </tbody>
             </table>
@@ -97,7 +97,7 @@ export default function Settings() {
           <div className="card">
             <div className="card-header"><h3 className="card-title">Prototype Status</h3></div>
             <div className="chip mb-8">IMPLEMENTED: driver monitoring (bus node) · dashboard UI</div>
-            <div className="chip mb-8">PROTOTYPE: multi-camera · GPS · IMU · load · siren (simulation)</div>
+            <div className="chip mb-8">PROTOTYPE: multi-camera · GPS · IMU · load · siren (estimated)</div>
             <div className="chip mb-8">PROPOSED/FUTURE: cabin AI · road AI · event fusion</div>
             <div className="mt-8">
               <button className="btn btn-primary" onClick={save} disabled={saving}>

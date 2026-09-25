@@ -96,41 +96,13 @@ function CapacityPressureCell({ bus }) {
   )
 }
 
-function DemandTrendCell({ bus }) {
-  const hourly = bus.boarding_by_hour || {}
-  const dailyTotal = bus.daily_boarding_total || 0
-  const peakHour = bus.boarding_peak_hour
-
-  if (!hourly || dailyTotal <= 0) {
-    return <span className="muted">—</span>
-  }
-
-  // Simple trend: compare morning vs afternoon
-  const morning = (parseInt(hourly['7'] || 0) + parseInt(hourly['8'] || 0) + parseInt(hourly['9'] || 0))
-  const afternoon = (parseInt(hourly['16'] || 0) + parseInt(hourly['17'] || 0) + parseInt(hourly['18'] || 0))
-
-  let trend = 'STABLE'
-  let trendColor = '#6b7280'
-  if (morning > afternoon * 1.3) {
-    trend = 'PEAK'
-    trendColor = 'var(--amber)'
-  } else if (afternoon > morning * 1.3) {
-    trend = 'EVENING'
-    trendColor = 'var(--accent)'
-  }
-
-  return (
-    <div>
-      <div className="mono" style={{ fontSize: 12 }}>{dailyTotal} pax/day</div>
-      <div style={{ fontSize: 10, color: trendColor }}>{trend}</div>
-    </div>
-  )
-}
+// NOTE: the per-bus Demand column (pax/day trends) was removed from this page
+// on purpose — demand belongs to the AI Suggestions operations page, not here.
 
 export default function LoadManagement() {
   const { data } = usePoll(api.buses, 4000)
   const buses = useMemo(() =>
-    [...(data?.buses || [])].sort((a, b) => (b.load.load_pct || 0) - (a.load.load_pct || 0)),
+    [...(data?.buses || [])].sort((a, b) => ((b.load?.load_pct) || 0) - ((a.load?.load_pct) || 0)),
     [data]
   )
   const showCabin = useMemo(() => buses.some((b) => b.cabin_occupancy), [buses])
@@ -181,6 +153,9 @@ export default function LoadManagement() {
           <h3 className="card-title">Bus Load Details</h3>
           <div className="flex gap-8">
             <span className="muted" style={{ fontSize: 11 }}>Sorted by load %</span>
+            <span className="chip" style={{ fontSize: 10, background: '#e0e7ff', color: '#2563eb' }}>
+              GVW range 15,080 – 17,000 kg
+            </span>
           </div>
         </div>
         <div className="table-wrap">
@@ -195,7 +170,6 @@ export default function LoadManagement() {
                 <th>Load %</th>
                 <th>Status</th>
                 <th>Capacity Pressure</th>
-                <th>Demand</th>
                 {showCabin && <th>Cabin Camera</th>}
               </tr>
             </thead>
@@ -225,25 +199,24 @@ export default function LoadManagement() {
                         </div>
                       </div>
                     </td>
-                    <td className="mono">{b.load.gvw_kg.toLocaleString()} kg</td>
+                    <td className="mono">{(b.load?.gvw_kg ?? 0).toLocaleString()} kg</td>
                     <td>
                       <div style={{ width: 80 }}>
                         <div className="flex justify-between" style={{ fontSize: 11 }}>
-                          <span className="mono">{b.load.load_pct}%</span>
+                          <span className="mono">{b.load?.load_pct ?? 0}%</span>
                         </div>
                         <div className="progress mt-8">
                           <div
                             style={{
-                              width: `${Math.min(100, b.load.load_pct)}%`,
-                              background: b.load.load_pct > 100 ? 'var(--red)' : b.load.load_pct > 90 ? 'var(--amber)' : 'var(--green)',
+                              width: `${Math.min(100, b.load?.load_pct ?? 0)}%`,
+                              background: (b.load?.load_pct ?? 0) > 100 ? 'var(--red)' : (b.load?.load_pct ?? 0) > 90 ? 'var(--amber)' : 'var(--green)',
                             }}
                           />
                         </div>
                       </div>
                     </td>
-                    <td><StatusBadge status={b.load.status} /></td>
+                    <td><StatusBadge status={b.load?.status || 'UNKNOWN'} /></td>
                     <td><CapacityPressureCell bus={b} /></td>
-                    <td><DemandTrendCell bus={b} /></td>
                     {showCabin && <td><CabinOccupancyCell occ={b.cabin_occupancy} /></td>}
                   </tr>
                 )

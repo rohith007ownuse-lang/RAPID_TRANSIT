@@ -299,20 +299,38 @@ def build_fleet_summary(buses, events, risk_items, mode, zones=None, route_index
                 },
             })
 
-    # --- incident summary from the existing event log ---
-    sev_counter = {}
-    status_counter = {}
-    for e in events:
-        sev_counter[e.get("severity") or "INFO"] = sev_counter.get(e.get("severity") or "INFO", 0) + 1
-        status_counter[e.get("status") or "ACTIVE"] = status_counter.get(e.get("status") or "ACTIVE", 0) + 1
-    incidents = {
-        "total": len(events),
-        "severity": sev_counter,
-        "status": status_counter,
-        "open": (status_counter.get("ACTIVE", 0) + status_counter.get("REVIEWING", 0)),
-        "acknowledged": status_counter.get("ACKNOWLEDGED", 0),
-        "resolved": status_counter.get("RESOLVED", 0),
-    }
+    # --- incident summary from the incident intelligence system ---
+    try:
+        from incident_intelligence import incident_store
+        all_incidents = incident_store.get_incidents(limit=10000)
+        inc_sev_counter = {}
+        inc_status_counter = {}
+        for inc in all_incidents:
+            inc_sev_counter[inc.severity] = inc_sev_counter.get(inc.severity, 0) + 1
+            inc_status_counter[inc.status] = inc_status_counter.get(inc.status, 0) + 1
+        incidents = {
+            "total": len(all_incidents),
+            "severity": inc_sev_counter,
+            "status": inc_status_counter,
+            "open": (inc_status_counter.get("OPEN", 0) + inc_status_counter.get("INVESTIGATING", 0)),
+            "acknowledged": inc_status_counter.get("ACKNOWLEDGED", 0),
+            "resolved": inc_status_counter.get("RESOLVED", 0),
+        }
+    except Exception:
+        # Fallback: count from raw events if incident store unavailable
+        sev_counter = {}
+        status_counter = {}
+        for e in events:
+            sev_counter[e.get("severity") or "INFO"] = sev_counter.get(e.get("severity") or "INFO", 0) + 1
+            status_counter[e.get("status") or "ACTIVE"] = status_counter.get(e.get("status") or "ACTIVE", 0) + 1
+        incidents = {
+            "total": len(events),
+            "severity": sev_counter,
+            "status": status_counter,
+            "open": (status_counter.get("ACTIVE", 0) + status_counter.get("REVIEWING", 0)),
+            "acknowledged": status_counter.get("ACKNOWLEDGED", 0),
+            "resolved": status_counter.get("RESOLVED", 0),
+        }
 
     # --- fleet risk aggregate ---
     by_level = {"LOW": 0, "MEDIUM": 0, "HIGH": 0, "CRITICAL": 0}

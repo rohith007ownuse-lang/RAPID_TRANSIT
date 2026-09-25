@@ -1,4 +1,4 @@
-# Urban Intelligence Control Centre — Implementation Plan (Overview)
+# Rapid Transit Control Centre — Implementation Plan (Overview)
 
 10 phases, executed in priority order. One phase at a time: implement -> typecheck
 (backend + frontend) -> restart backend -> curl endpoints -> screenshot -> report.
@@ -376,3 +376,215 @@ actual persisted data with strict data-source honesty (SIMULATION/LIVE/HEURISTIC
 **Verification.** 624/624 backend tests pass ✅ (75 new Phase 17 tests).
 Frontend builds ✅. All API endpoints return proper JSON with simulation/mode flags.
 Historical analytics show INSUFFICIENT_DATA when no records exist (not zero-filled).
+
+## Phase 18 — WebSocket Reliability, Reconnection & Real-Time Communication Hardening ✅ **COMPLETE**
+
+**Overview.** Hardened the WebSocket system with connection lifecycle management, exponential
+backoff reconnection, message deduplication, heartbeat/ping mechanism, message priority
+queuing, event coalescing, server-side connection tracking, and state resynchronization
+after reconnect. Added a frontend WebSocket client with automatic reconnection and a
+connection status indicator component.
+
+**Files**
+- NEW `backend/websocket_hardening.py` — WebSocket hardening module (~876 lines):
+  - `ConnectionState` enum (DISCONNECTED/CONNECTING/CONNECTED/AUTHENTICATING/READY/RECONNECTING/ERROR)
+  - `MessagePriority` enum (CRITICAL/IMPORTANT/NORMAL/TRANSIENT)
+  - `MessageType` constants for full WebSocket message protocol
+  - `MessageDeduplicator`: thread-safe event ID deduplication with configurable window (5 min default)
+  - `EventCoalescer`: coalesce high-frequency telemetry (health/ETA/load updates), pass through discrete events
+  - `ConnectionStateManager`: connection state with listeners, staleness detection
+  - `MessagePriorityQueue`: bounded priority queue (max 100), critical messages never dropped
+  - `validate_message()`: JSON validation, required field checks per message type
+  - `classify_message_priority()`: route messages to priority levels based on type/severity
+  - `calculate_backoff()`: exponential backoff with jitter (1-30s range)
+  - `ReconnectionManager`: attempt tracking, backoff, max attempts configuration
+  - `ServerConnectionTracker`: server-side connection registry (max 100 subscribers)
+  - `StateResynchronizer`: REST API sync plan for reconnect recovery
+  - `WebSocketMetrics`: messages sent/received/failed/dropped, connections, dedup hits
+  - `preserve_data_source()`: prevent LIVE↔SIMULATION/HEURISTIC/UNKNOWN conversion
+  - Close codes (1000, 1001, 1002, 1003, 1008, 1011, 4001, 4002, 4003)
+- `backend/websocket_handler.py` — Updated with Phase 18 hardening:
+  - Enhanced `_conn_handler()` with message validation, error isolation, metrics collection
+  - Added `_send_state_snapshot()` for state recovery after reconnect
+  - Enhanced `_push_alert()` with deduplication and metrics
+  - Enhanced `_push_road_event()` and `_push_road_risk_update()` with metrics
+  - Added `_ping_dashboard_clients()` for server-initiated heartbeat
+  - Added `_cleanup_stale_connections()` for connection health management
+  - Added `get_ws_metrics()`, `get_ws_connections()`, `get_ws_status()` public APIs
+  - Updated `_subscribe_dashboard()` with connection tracking and rate limiting
+- `backend/server.py` — Added 2 new API endpoints:
+  - `GET /api/websocket/status` — WebSocket server status and metrics
+  - `GET /api/websocket/metrics` — WebSocket performance metrics
+- NEW `frontend/src/websocket.js` — Frontend WebSocket client (~380 lines):
+  - `FleetWebSocketClient` class with connection lifecycle management
+  - Exponential backoff reconnection (1-30s, configurable max attempts)
+  - Message deduplication (5-minute window)
+  - Heartbeat/ping mechanism (15s interval)
+  - State resynchronization via REST APIs after reconnect
+  - Connection state listeners for UI updates
+  - Message queue for messages sent while disconnected
+  - Singleton pattern for shared connection across components
+- `frontend/src/api.js` — Added 2 new API client functions:
+  - `websocketStatus()` — Get WebSocket server status
+  - `websocketMetrics()` — Get WebSocket performance metrics
+- NEW `frontend/src/components/ConnectionStatus.jsx` — Connection status indicator:
+  - Compact and full display modes
+  - Color-coded state (green/amber/red)
+  - Stale data warning (60s timeout)
+  - Connect/disconnect toggle
+- `backend/tests/test_phase18_websocket_hardening.py` — 80 tests covering:
+  - MessageDeduplicator (8 tests): basic, duplicates, window expiry, clear, size, thread safety
+  - EventCoalescer (5 tests): non-coalesced pass-through, coalescing, different bus IDs, clear
+  - ConnectionStateManager (9 tests): initial state, set state, listeners, staleness, reconnect attempts
+  - MessagePriorityQueue (7 tests): put/get, priority ordering, max size, critical never dropped
+  - ServerConnectionTracker (6 tests): register/unregister, capacity, stale connections, thread safety
+  - ReconnectionManager (5 tests): should reconnect, max attempts, success resets, delay calculation
+  - StateResynchronizer (3 tests): needs sync, record sync, sync plan
+  - WebSocketMetrics (4 tests): record, get all, reset, negative values
+  - validate_message (11 tests): valid/invalid JSON, missing fields, message types
+  - classify_message_priority (8 tests): alerts, events, bus state, heartbeat
+  - calculate_backoff (2 tests): increasing delay, max delay cap
+  - preserve_data_source (3 tests): valid/invalid overrides
+  - create_ws_message (2 tests): basic message, with source
+  - Constants (4 tests): non-coalesced types, coalesced types, close codes, config values
+  - Integration (3 tests): full dedup workflow, full priority workflow, connection lifecycle
+
+**Key Design Decisions**
+- WebSocket is the real-time delivery mechanism, NOT the source of truth
+- After reconnect, recover state from REST APIs (fleet, buses, alerts, incidents, risk, events)
+- Never fabricate events or timestamps
+- Preserve LIVE/SIMULATION/HEURISTIC/UNKNOWN data sources
+- Critical events (incidents, alerts) are never coalesced
+- High-frequency telemetry (health, ETA, load) can be coalesced safely
+- Server-side deduplication prevents duplicate alert delivery
+- Dashboard clients receive server-initiated pings for connection health
+- Stale connections (60s no messages) are automatically cleaned up
+- Rate limiting: max 100 dashboard subscribers
+
+**Data Flow (Post Phase 18)**
+```
+Bus Node → WS:8765 → websocket_handler → store → alerts.py → _push_alert() → dashboard
+                            ↓
+                    websocket_hardening
+                    (dedup, validate, metrics)
+                            ↓
+                    ServerConnectionTracker
+                    (connection health, stale cleanup)
+```
+
+**Verification.** 80/80 Phase 18 tests pass ✅. All existing tests continue to pass.
+Frontend builds ✅. WebSocket server status endpoint returns proper JSON.
+Connection status indicator available for frontend integration.
+
+## Phase 19 — Offline, Failure Detection, Degraded Modes & System Resilience ✅ **COMPLETE**
+
+**Overview.** Added comprehensive system health monitoring, failure detection, degraded mode
+support, and data freshness tracking. The control centre now clearly distinguishes between
+healthy, degraded, disconnected, unavailable, stale, recovering, failed, and unknown states.
+A missing subsystem must never silently appear healthy.
+
+**Files**
+- NEW `backend/system_health.py` — System health module (~450 lines):
+  - `HealthState` enum (HEALTHY/DEGRADED/DISCONNECTED/STARTING/STOPPING/FAILED/RECOVERING/UNKNOWN)
+  - `DataFreshness` enum (FRESH/STALE/UNAVAILABLE/UNKNOWN)
+  - `SubsystemHealth` class: per-subsystem health tracking with:
+    - State transitions with debounce (prevents recovery flapping)
+    - Data freshness tracking
+    - Error counting and last error
+    - Success counting
+    - State change listeners
+    - Thread-safe operations
+  - `SystemHealthManager` class: manages all subsystems with:
+    - Overall health calculation
+    - Freshness updates
+    - State change notifications
+    - Serialization for API
+  - `initialize_health_tracking()`: registers all known subsystems
+  - Convenience functions: `record_subsystem_success()`, `record_subsystem_failure()`, `get_subsystem_health()`, `get_system_health()`
+  - Staleness thresholds per subsystem type
+  - Recovery flapping prevention (10s debounce)
+- `backend/persistence.py` — Added health tracking for persistence operations:
+  - `save_event()` now records success/failure for health tracking
+  - `_record_persistence_success()` and `_record_persistence_failure()` helpers
+  - Persistence failures are caught and logged without breaking event pipeline
+- `backend/data_store.py` — Enhanced `add_event()` with failure isolation:
+  - Persistence failures are now caught and logged
+  - Events remain in memory even if persistence fails
+  - Health tracking integrated for persistence subsystem
+- `backend/server.py` — Added 2 new API endpoints:
+  - `GET /api/system/health` — Full system health status with all subsystems
+  - `GET /api/system/health/<subsystem_name>` — Per-subsystem health status
+  - Health tracking initialized at server startup
+- `backend/ai/camera_manager.py` — Enhanced camera failure handling:
+  - Capture loop now updates source state to ERROR on exception
+  - Health tracking integrated for driver/cabin cameras
+  - Camera recovery recorded on successful frame capture
+- `backend/ai/cabin/occupancy.py` — Enhanced cabin occupancy failure handling:
+  - Health tracking integrated for cabin occupancy subsystem
+  - Failures recorded for estimator errors and camera unavailability
+  - Success recorded on successful occupancy estimation
+- `frontend/src/api.js` — Added 2 new API client functions:
+  - `systemHealth()` — Get full system health status
+  - `subsystemHealth(name)` — Get per-subsystem health
+- NEW `frontend/src/components/SystemHealth.jsx` — System health panel (~280 lines):
+  - Overall system health indicator
+  - Per-subsystem health status with color-coded badges
+  - Data freshness indicators
+  - Error counts and last success time
+  - Compact and full display modes
+  - Auto-refresh every 10 seconds
+- `backend/tests/test_phase19_system_health.py` — 35 tests covering:
+  - SubsystemHealth (13 tests): initial state, success, failure, critical failure, consecutive failures, disconnect, starting, stopping, recovery, freshness, serialization, listeners, thread safety
+  - SystemHealthManager (8 tests): register, get, get_all, overall health, freshness updates, serialization
+  - Convenience functions (4 tests): success, failure, get health, get system health
+  - Initialize health tracking (2 tests): initialization, staleness thresholds
+  - Integration (4 tests): full lifecycle, independent subsystems, serialization, recovery debounce
+  - Constants (4 tests): health states, freshness states, recovery debounce
+
+**Key Design Decisions**
+- A missing subsystem must never silently appear healthy
+- UNKNOWN/UNAVAILABLE/STALE are honest representations, not fallback values
+- Recovery flapping prevention via debounce (10s window)
+- Persistence failures are non-blocking but observable
+- Camera failures are isolated per-slot (one camera failing doesn't affect another)
+- Cabin occupancy uses null values (not 0) when unavailable
+- Health state transitions are logged and observable via API
+- Frontend shows system health with clear visual indicators
+
+**Subsystem Health Model**
+```
+HEALTHY      → Subsystem operational, data fresh
+DEGRADED     → Subsystem partially operational or experiencing errors
+DISCONNECTED → Subsystem not connected (camera unplugged, WebSocket down)
+STARTING     → Subsystem initializing
+STOPPING     → Subsystem shutting down
+FAILED       → Subsystem not operational (critical error or 3+ failures)
+RECOVERING   → Subsystem recovering from failure
+UNKNOWN      → Subsystem state cannot be determined
+```
+
+**Data Freshness Model**
+```
+FRESH        → Recent valid data (< threshold)
+STALE        → Last known data exists but older than threshold
+UNAVAILABLE  → No valid data currently available
+UNKNOWN      → System cannot determine current state
+```
+
+**Failure Isolation**
+- Camera failures: isolated per-slot (driver/cabin independent)
+- Persistence failures: caught and logged, events remain in memory
+- WebSocket failures: isolated per-client, server continues
+- Alert processing failures: logged, events still created
+- Background thread failures: caught, thread continues or exits gracefully
+
+**Degraded Mode Examples**
+- Driver camera unavailable → Driver safety: UNAVAILABLE
+- Cabin camera unavailable → Occupancy: UNKNOWN
+- Vehicle telemetry stale → Vehicle health: STALE
+- WebSocket disconnected → REST APIs still available
+- Persistence failed → Events in memory, will persist on recovery
+
+**Verification.** 35/35 Phase 19 tests pass ✅. All existing tests continue to pass.
+Frontend builds ✅. System health endpoints return proper JSON with all subsystems.
+Health tracking integrated into persistence, cameras, and cabin occupancy.

@@ -53,7 +53,7 @@ See `ai_urban_management.md` for the running phase log.
 ## Project Layout
 
 ```
-AI_Urban_Intelligence_Platform/
+Rapid-Tracker/
 ├── PLAN.md                     ← Architecture, flow diagrams, phases
 ├── config/system_config.json   ← All thresholds + bus/sensor settings
 ├── bus_node/                   ← Python code that runs on each bus
@@ -87,7 +87,7 @@ From the project root:
 .../venv/bin/python bus_node/main.py --camera-index 1
 ```
 
-Run from `AI_Urban_Intelligence_Platform/` so `config/system_config.json` is found.
+Run from `Rapid-Tracker/` so `config/system_config.json` is found.
 
 The full bus-node pipeline (Phase 8): cameras + driver monitoring + simulated
 sensors + event fusion + WebSocket stream to the Control Centre:

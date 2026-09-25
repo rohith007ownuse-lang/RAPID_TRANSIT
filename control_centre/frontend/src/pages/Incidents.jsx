@@ -1,18 +1,15 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { api, usePoll } from '../api.js'
 import { PageHeader, SimBadge } from '../components/Layout.jsx'
 import { StatusBadge } from '../components/UI.jsx'
 import { eventLabel } from '../components/AlertFeed.jsx'
-import { ReviewState, BulkReviewEditor } from '../components/ReviewStatus.jsx'
+import AcknowledgeModal from '../components/AcknowledgeModal.jsx'
+import { EventDecisionExpander } from '../components/DecisionExplain.jsx'
+import { IncidentSlaPanel } from '../components/BackendOnlyPanels.jsx'
+import { ReviewState } from '../components/ReviewStatus.jsx'
 import { useAuth } from '../lib/authContext.jsx'
 
 const FILTERS = ['ALL', 'CRITICAL', 'WARNING', 'INFO']
-
-const EDIT_OPTIONS = [
-  { value: 'ACTIVE', label: 'Not reviewed', hint: 'nothing / nobody has looked at this yet', cls: 'rs-opt-new', symbol: '○' },
-  { value: 'REVIEWING', label: 'Reviewing', hint: 'an operator is on the live feed right now', cls: 'rs-opt-reviewing', symbol: '●' },
-  { value: 'ACKNOWLEDGED', label: 'Acknowledged', hint: 'checked, no real problem — everyone sees it is handled', cls: 'rs-opt-acked', symbol: '✓' },
-]
 
 const INCIDENT_SEVERITY_COLORS = {
   CRITICAL: 'var(--red)',
@@ -31,14 +28,32 @@ const INCIDENT_PRIORITY_COLORS = {
 
 const INCIDENT_STATUS_COLORS = {
   OPEN: 'var(--red)',
+  DETECTED: 'var(--red)',
+  CONFIRMED: '#f97316',
   ACKNOWLEDGED: 'var(--amber)',
   INVESTIGATING: 'var(--accent)',
+  ASSIGNED: '#a855f7',
+  RESPONDING: '#0ea5e9',
   RESOLVED: 'var(--green)',
   CLOSED: '#94a3b8',
 }
 
+const ASSIGNABLE_STATUSES = ['OPEN', 'DETECTED', 'CONFIRMED']
+
 function IncidentCard({ incident, canEdit, operator, onAction }) {
   const [expanded, setExpanded] = useState(false)
+  const [ackOpen, setAckOpen] = useState(false)
+  const [assignee, setAssignee] = useState(operator || '')
+
+  const submitAck = async (payload) => {
+    try {
+      await api.acknowledgeIncident(incident.incident_id, { operator, ...payload })
+      onAction?.()
+    } catch (err) {
+      console.error('Acknowledge failed:', err)
+    }
+    setAckOpen(false)
+  }
 
   const handleAction = async (action) => {
     try {
@@ -91,7 +106,12 @@ function IncidentCard({ incident, canEdit, operator, onAction }) {
         <div><strong>Data:</strong> <StatusBadge status={incident.data_source} /></div>
         <div><strong>Created:</strong> {new Date(incident.created_at).toLocaleString()}</div>
         {incident.acknowledged_by && <div><strong>Acknowledged by:</strong> {incident.acknowledged_by}</div>}
+        {incident.ack_issue_type && <div><strong>Issue type:</strong> {incident.ack_issue_type}</div>}
+        {incident.ack_cause && <div><strong>Cause:</strong> {incident.ack_cause}</div>}
+        {incident.ack_note && <div><strong>Note:</strong> {incident.ack_note}</div>}
         {incident.resolved_by && <div><strong>Resolved by:</strong> {incident.resolved_by}</div>}
+        {incident.assigned_to && <div><strong>Assigned to:</strong> {incident.assigned_to}</div>}
+        {(incident.escalation_level || 0) > 0 && <div><strong>Escalation:</strong> ×{incident.escalation_level} ({incident.assign_attempts} attempt(s))</div>}
       </div>
 
       {incident.evidence?.length > 0 && (
@@ -129,12 +149,23 @@ function IncidentCard({ incident, canEdit, operator, onAction }) {
           {expanded ? 'Collapse' : 'Expand'}
         </button>
 
+        {incident.status === 'DETECTED' && (
+          <button
+            className="btn btn-primary"
+            style={{ fontSize: 12 }}
+            onClick={() => handleAction(() => api.confirmIncident(incident.incident_id, { operator }))}
+          >
+            Confirm
+          </button>
+        )}
+
         {incident.status === 'OPEN' && (
           <>
+            {/* Acknowledge opens the popup (issue type / cause / operator / note) */}
             <button
               className="btn btn-ack"
               style={{ fontSize: 12 }}
-              onClick={() => handleAction(() => api.acknowledgeIncident(incident.incident_id, { operator }))}
+              onClick={() => setAckOpen(true)}
             >
               ✓ Acknowledge
             </button>
@@ -179,7 +210,53 @@ function IncidentCard({ incident, canEdit, operator, onAction }) {
             Close
           </button>
         )}
+
+        {ASSIGNABLE_STATUSES.includes(incident.status) && (
+          <>
+            <input
+              className="input"
+              style={{ fontSize: 12, maxWidth: 140 }}
+              placeholder="Assign to operator"
+              value={assignee}
+              onChange={(e) => setAssignee(e.target.value)}
+            />
+            <button
+              className="btn btn-primary"
+              style={{ fontSize: 12 }}
+              onClick={() => handleAction(() => api.assignIncident(incident.incident_id, { operator, assignee })) }
+            >
+              Assign
+            </button>
+          </>
+        )}
+
+        {incident.status === 'ASSIGNED' && (
+          <>
+            <button
+              className="btn btn-primary"
+              style={{ fontSize: 12 }}
+              onClick={() => handleAction(() => api.respondIncident(incident.incident_id, { operator }))}
+            >
+              Respond
+            </button>
+            <button
+              className="btn btn-ghost"
+              style={{ fontSize: 12 }}
+              onClick={() => handleAction(() => api.rejectIncident(incident.incident_id, { operator }))}
+            >
+              Reject
+            </button>
+          </>
+        )}
       </div>
+
+      <AcknowledgeModal
+        open={ackOpen}
+        onClose={() => setAckOpen(false)}
+        onSubmit={submitAck}
+        operator={operator}
+        context={{ busId: incident.bus_id, title: incident.title }}
+      />
     </div>
   )
 }
@@ -187,9 +264,9 @@ function IncidentCard({ incident, canEdit, operator, onAction }) {
 export default function Incidents() {
   const { user } = useAuth()
   const [filter, setFilter] = useState('ALL')
-  const [editingId, setEditingId] = useState(null)
-  const [draft, setDraft] = useState('ACTIVE')
   const [viewMode, setViewMode] = useState('events') // 'events' or 'incidents'
+  // Acknowledge popup target — an event, or { all: true } for acknowledge-all.
+  const [ackTarget, setAckTarget] = useState(null)
   const { data: eventsData, refetch: refetchEvents } = usePoll(api.events, 4000)
   const { data: incidentsData, refetch: refetchIncidents } = usePoll(api.incidents, 4000)
   const { data: incidentSummaryData } = usePoll(api.incidentSummary, 8000)
@@ -203,32 +280,53 @@ export default function Incidents() {
   const canEdit = opRole === 'supervisor' || opRole === 'admin'
   const operator = () => `${opName} (${opRole})`
 
-  const filtered = filter === 'ALL' ? events : events.filter((e) => e.severity === filter)
+  const filtered = filter === 'ALL'
+    ? events.filter((e) => (e.event_type || '').toUpperCase() !== 'VEHICLE_ANOMALY' && (e.severity || '').toUpperCase() !== 'INFO')
+    : events.filter((e) => (e.severity || '').toUpperCase() === filter)
+  // CRITICAL always first, then WARNING, then the rest; unfinished work outranks finished.
+  const tierRank = (e) => (e.severity === 'CRITICAL' ? 0 : e.severity === 'WARNING' || e.severity === 'HIGH' ? 1 : 2)
+  const statusRank = (e) => (e.status === 'ACTIVE' ? 0 : e.status === 'REVIEWING' ? 1 : e.status === 'ACKNOWLEDGED' ? 2 : 3)
+  const sortedEvents = useMemo(() =>
+    [...filtered].sort((a, b) =>
+      tierRank(a) - tierRank(b)
+      || statusRank(a) - statusRank(b)
+      || new Date(b.timestamp) - new Date(a.timestamp)
+    ),
+    [events, filter]
+  )
+
+  const unresolved = incidents.filter((i) => !['RESOLVED', 'CLOSED'].includes(i.status)).length
+  const resolved = incidents.length - unresolved
+  const acknowledgedCount = incidents.filter((i) => i.status === 'ACKNOWLEDGED' || i.acknowledged_by).length
 
   const openLiveFeed = (e) => {
     api.review(e.event_id, { operator: operator() }).catch(() => {})
     window.open('/fleet/' + encodeURIComponent(e.bus_id), '_blank')
   }
 
-  const acknowledge = (e) => {
-    api.acknowledge(e.event_id, { operator: operator() }).catch(() => {})
+  const submitAck = async (payload) => {
+    const t = ackTarget
+    if (!t) return
+    try {
+      if (t.all) {
+        const targets = events.filter((e) => e.status === 'ACTIVE' || e.status === 'REVIEWING')
+        await Promise.all(targets.map((e) => api.acknowledge(e.event_id, { operator: operator(), ...payload }).catch(() => {})))
+      } else {
+        await api.acknowledge(t.event_id, { operator: operator(), ...payload })
+      }
+      refetchEvents()
+      refetchIncidents()
+    } catch (err) {
+      console.error('Acknowledge failed:', err)
+    }
+    setAckTarget(null)
   }
 
   const resolve = (e) => {
-    api.resolve(e.event_id, { operator: operator() }).catch(() => {})
-  }
-
-  const startEdit = (e) => {
-    setDraft(e.status === 'RESOLVED' ? 'ACKNOWLEDGED' : e.status)
-    setEditingId(e.event_id)
-  }
-
-  const submitEdit = (e) => {
-    api.setStatus(e.event_id, { status: draft, operator: operator() }).then(() => setEditingId(null)).catch(() => {})
-  }
-
-  const cancelEdit = () => {
-    setEditingId(null)
+    api.resolve(e.event_id, { operator: operator() }).then(() => {
+      refetchEvents()
+      refetchIncidents()
+    }).catch(() => {})
   }
 
   return (
@@ -251,7 +349,32 @@ export default function Incidents() {
         )}
       </div>
 
+      {/* Workflow counts — how many are still open vs resolved */}
+      <div className="card mb-16">
+        <div className="card-header">
+          <h3 className="card-title">Incident Workflow</h3>
+        </div>
+        <div className="flex wrap gap-8 align-center">
+          <span className="chip" style={{ margin: 0 }}>
+            <span className="rs-dot" style={{ background: 'var(--red)' }} />
+            <strong>Not finished:</strong> {unresolved}
+          </span>
+          <span className="chip" style={{ margin: 0 }}>
+            <span className="rs-dot" style={{ background: 'var(--green)' }} />
+            <strong>Resolved:</strong> {resolved}
+          </span>
+          <span className="chip" style={{ margin: 0 }}>
+            <span className="rs-dot" style={{ background: 'var(--amber)' }} />
+            <strong>Acknowledged:</strong> {acknowledgedCount}
+          </span>
+          <span className="chip" style={{ margin: 0 }}>
+            <strong>Total:</strong> {incidents.length}
+          </span>
+        </div>
+      </div>
+
       {/* View mode toggle */}
+      <IncidentSlaPanel />
       <div className="card mb-16">
         <div className="card-header">
           <h3 className="card-title">View</h3>
@@ -310,34 +433,33 @@ export default function Incidents() {
               <span className="chip"><span className="rs-dot" style={{ background: '#cbd5e1' }} /> <strong>white</strong> — operator hasn&apos;t looked at it yet</span>
               <span className="chip"><span className="rs-dot" style={{ background: 'var(--amber)' }} /> <strong>amber</strong> — open live feed · being reviewed</span>
               <span className="chip"><span className="rs-dot" style={{ background: 'var(--green)' }} /> <strong>green</strong> — acknowledged / resolved</span>
-              <span className="chip">✎ <strong>Edit status</strong> — operator manually sets the review state</span>
+              <span className="chip"><strong>Critical first</strong> — acknowledgements open a popup (issue type, cause, operator, note)</span>
             </div>
-            <div className="mt-16">
-              <BulkReviewEditor events={filtered} buttonLabel="✎ Edit status for all incidents at once" />
-            </div>
+            {canEdit && (
+              <div className="mt-8">
+                <button
+                  className="btn btn-sm btn-ghost"
+                  style={{ fontSize: 11 }}
+                  onClick={() => setAckTarget({ all: true })}
+                >
+                  ✓ Acknowledge all ({events.filter((e) => e.status === 'ACTIVE' || e.status === 'REVIEWING').length})
+                </button>
+              </div>
+            )}
           </>
         )}
       </div>
 
-      {/* Events grid */}
+      {/* Events grid — CRITICAL first, then WARNING, then everything else.
+          VEHICLE_ANOMALY and INFO-tier events never render. */}
       {viewMode === 'events' && (
         <div className="grid" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))', gap: 16 }}>
-          {filtered.length === 0 && <div className="card empty">No incidents match the filter.</div>}
-          {filtered.map((e) => (
+          {sortedEvents.length === 0 && <div className="card empty">No incidents match the filter.</div>}
+          {sortedEvents.map((e) => (
             <div className="card" key={e.event_id} style={{ borderTop: `4px solid ${e.severity === 'CRITICAL' ? 'var(--red)' : e.severity === 'WARNING' ? 'var(--amber)' : 'var(--accent)'}` }}>
               <div className="flex justify-between align-center mb-8">
                 <strong>{eventLabel(e.event_type)}</strong>
-                <div className="flex align-center" style={{ gap: 8 }}>
-                  <ReviewState status={e.status} />
-                  <button
-                    className="btn-ghost rs-edit-btn"
-                    title={canEdit ? 'Edit review status' : 'Requires Supervisor or Admin role'}
-                    onClick={() => canEdit && startEdit(e)}
-                    style={canEdit ? undefined : { opacity: 0.45, cursor: 'not-allowed' }}
-                  >
-                    ✎ Edit status
-                  </button>
-                </div>
+                <ReviewState status={e.status} />
               </div>
               <div className="muted" style={{ fontSize: 13, lineHeight: 1.7 }}>
                 <div><strong>Bus:</strong> {e.bus_id}</div>
@@ -351,45 +473,15 @@ export default function Incidents() {
                 {e.resolved_by && <div style={{ fontSize: 12 }}>⚪ resolved — {e.resolved_by}</div>}
               </div>
 
-              {editingId === e.event_id ? (
-                <div className="mt-16 rs-edit-form">
-                  <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
-                    <strong>Set review status</strong> — which state should this incident be in?
-                  </div>
-                  <div className="grid" style={{ gap: 8 }}>
-                    {EDIT_OPTIONS.map((opt) => (
-                      <label
-                        key={opt.value}
-                        className={`rs-option ${opt.cls} ${draft === opt.value ? 'rs-option-sel' : ''}`}
-                      >
-                        <input
-                          type="radio"
-                          name={`status-${e.event_id}`}
-                          value={opt.value}
-                          checked={draft === opt.value}
-                          onChange={() => setDraft(opt.value)}
-                        />
-                        <span><span className="rs-opt-symbol">{opt.symbol}</span> <strong>{opt.label}</strong></span>
-                        <span className="rs-opt-hint">{opt.hint}</span>
-                      </label>
-                    ))}
-                  </div>
-                  <div className="flex gap-8 mt-16">
-                    <button className="btn btn-primary" style={{ fontSize: 12, flex: 1 }} onClick={() => submitEdit(e)}>
-                      Submit status
-                    </button>
-                    <button className="btn" style={{ fontSize: 12, flex: 1 }} onClick={cancelEdit}>
-                      ← Back
-                    </button>
-                  </div>
-                </div>
-              ) : (
+              <EventDecisionExpander eventId={e.event_id} />
+
+              {(
                 <div className="flex gap-8 mt-16 wrap">
                   <button className="btn btn-primary" style={{ fontSize: 12 }} onClick={() => openLiveFeed(e)}>
                     ▶ Open Live Feed
                   </button>
                   {(e.status === 'ACTIVE' || e.status === 'REVIEWING') && (
-                    <button className="btn btn-ack" style={{ fontSize: 12 }} onClick={() => acknowledge(e)}>
+                    <button className="btn btn-ack" style={{ fontSize: 12 }} onClick={() => setAckTarget(e)}>
                       ✓ Acknowledge
                     </button>
                   )}
@@ -406,17 +498,21 @@ export default function Incidents() {
                 </div>
               )}
 
-              {e.simulation && <div className="muted mt-8" style={{ fontSize: 11 }}>simulated demo</div>}
+              {e.simulation && <div className="muted mt-8" style={{ fontSize: 11 }}>estimated demo</div>}
             </div>
           ))}
         </div>
       )}
 
-      {/* Incidents grid */}
+      {/* Incidents grid — demo rotation keeps the live pool to ~5 incidents;
+          resolved/closed history stays in the workflow chips above. */}
       {viewMode === 'incidents' && (
         <div className="grid" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(400px, 1fr))', gap: 16 }}>
           {incidents.length === 0 && <div className="card empty">No incidents created yet.</div>}
-          {incidents.map((inc) => (
+          {incidents
+            .filter((inc) => !['RESOLVED', 'CLOSED'].includes(inc.status))
+            .slice(0, 5)
+            .map((inc) => (
             <IncidentCard
               key={inc.incident_id}
               incident={inc}
@@ -430,6 +526,16 @@ export default function Incidents() {
           ))}
         </div>
       )}
+
+      {/* Acknowledge popup — used by both event and incident acknowledge */}
+      <AcknowledgeModal
+        open={!!ackTarget}
+        onClose={() => setAckTarget(null)}
+        onSubmit={submitAck}
+        operator={operator()}
+        allMode={!!ackTarget?.all}
+        context={{ busId: ackTarget?.bus_id, title: ackTarget?.all ? 'All unfinished incidents' : eventLabel(ackTarget?.event_type || '') }}
+      />
     </>
   )
 }

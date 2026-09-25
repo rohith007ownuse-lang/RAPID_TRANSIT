@@ -118,11 +118,15 @@ class TestMultiCameraMode:
             ok, msg = mgr.set_multi_camera_mode()
             assert ok is True, msg  # driver still runs
             assert mgr.is_slot_active(SLOT_DRIVER) is True
+            # No shared fallback: the driver feed is DDS-only and must never
+            # be counted as passengers, so a failed cabin reports
+            # DISCONNECTED honestly instead of mirroring the driver feed.
             assert mgr.is_slot_active(SLOT_CABIN) is False
             status = mgr.get_camera_status()
             assert status["slots"][SLOT_DRIVER]["status"] == "CONNECTED"
             assert status["slots"][SLOT_CABIN]["status"] == "DISCONNECTED"
-            assert "Failed to open camera" in (status["slots"][SLOT_CABIN]["error"] or "")
+            assert status["slots"][SLOT_CABIN]["shared"] is False
+            assert status["slots"][SLOT_CABIN]["shared_with"] is None
             assert status["available_cameras"] == [0]
 
     def test_driver_failure_does_not_stop_cabin(self):

@@ -37,16 +37,18 @@ from road_event_model import (
 ENFIELD_BOUNDS = {"south": 12.85, "west": 80.10, "north": 13.30, "east": 80.40}
 
 # Clustering threshold: defects within this distance (km) are grouped
-CLUSTER_RADIUS_KM = 0.3  # ~300m
+CLUSTER_RADIUS_KM = 0.03  # ~30m
 
 # Minimum detections to form a risk zone (avoids single-signal zones)
 MIN_DEFECTS_FOR_ZONE = 1
 
 
 def _level_for_score(score: float) -> str:
+    # HIGH starts at 60 (aligned with the risk engine) so the high-risk tier
+    # stays focused on the 60–70+ band worth operator attention.
     if score >= 80:
         return "CRITICAL"
-    if score >= 55:
+    if score >= 60:
         return "HIGH"
     if score >= 30:
         return "MEDIUM"

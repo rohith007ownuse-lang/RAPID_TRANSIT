@@ -1,6 +1,10 @@
 import React from 'react'
 
-const BASE = '/api'
+// Same-origin by default (dev proxy or a reverse proxy in front of both).
+// Set VITE_API_BASE to an absolute origin when the API is hosted separately,
+// e.g. VITE_API_BASE=https://api.example.com — the backend must then list
+// this frontend's origin in FLEETIQ_CORS_ORIGINS.
+const BASE = (import.meta.env && import.meta.env.VITE_API_BASE) || '/api'
 const TOKEN_KEY = 'aiuc_token'
 
 const AUTH_ROLES = ['operator', 'supervisor', 'admin']
@@ -70,10 +74,12 @@ export const api = {
   },
   roadDefects: () => get('/road-defects'),
   analytics: () => get('/analytics'),
+  analyticsDrilldown: () => get('/analytics/incidents-drilldown'),
   risk: () => get('/risk'),
   busRisk: (id) => get(`/buses/${encodeURIComponent(id)}/risk`),
   busRiskHistory: (id, limit = 20) => get(`/buses/${encodeURIComponent(id)}/risk/history?limit=${limit}`),
   busRiskTrend: (id) => get(`/buses/${encodeURIComponent(id)}/risk/trend`),
+  busRiskPrediction: (id, minutes = 30) => get(`/risk/predict/${encodeURIComponent(id)}?minutes=${minutes}`),
   riskEvents: (params = {}) => {
     const qs = new URLSearchParams(params).toString()
     return get(`/risk/events${qs ? `?${qs}` : ''}`)
@@ -100,6 +106,16 @@ export const api = {
   busRoadThreats: (id) => get(`/buses/${encodeURIComponent(id)}/road-threats`),
   busRoadExposure: (id) => get(`/buses/${encodeURIComponent(id)}/road-exposure`),
   roadsExposures: () => get('/roads/exposures'),
+
+  // Traffic heat-map + maintenance (Rapid Transit upgrades)
+  trafficHotspots: () => get('/traffic/hotspots'),
+  trafficAnalytics: () => get('/traffic/analytics'),
+  trafficHeatmap: () => get('/traffic/heatmap'),
+  trafficStats: () => get('/traffic/stats'),
+  pedestrianStats: () => get('/pedestrian/stats'),
+  odAnalytics: () => get('/od/analytics'),
+  operationsAnalytics: () => get('/analytics/operations'),
+  busHealth: (id) => get(`/buses/${encodeURIComponent(id)}/health`),
   settings: () => get('/settings'),
   getMode: () => get('/mode'),
   liveStatus: () => get('/live/status'),
@@ -110,6 +126,7 @@ export const api = {
   aiStatus: () => get('/ai/status'),
   potholeStats: () => get('/ai/pothole/stats'),
   driverState: () => get('/ai/driver/state'),
+  aiInsights: () => get('/ai/insights'),
   ddsStatus: () => get('/dds/status'),
   ddsSubprocess: () => get('/dds/subprocess/status'),
   ddsLogs: () => get('/dds/logs'),
@@ -126,12 +143,20 @@ export const api = {
   incidentByEvent: (eventId) => get(`/incidents/by-event/${eventId}`),
   acknowledgeIncident: (id, opts = {}) => postJson(`/incidents/${id}/acknowledge`, opts),
   investigateIncident: (id, opts = {}) => postJson(`/incidents/${id}/investigate`, opts),
+  assignIncident: (id, opts = {}) => postJson(`/incidents/${id}/assign`, opts),
+  respondIncident: (id, opts = {}) => postJson(`/incidents/${id}/respond`, opts),
+  rejectIncident: (id, opts = {}) => postJson(`/incidents/${id}/reject`, opts),
+  assignedIncidents: () => get('/incidents/assigned'),
   resolveIncident: (id, opts = {}) => postJson(`/incidents/${id}/resolve`, opts),
   closeIncident: (id, opts = {}) => postJson(`/incidents/${id}/close`, opts),
 
   // ---- WebSocket Status (Phase 18) ----
   websocketStatus: () => get('/websocket/status'),
   websocketMetrics: () => get('/websocket/metrics'),
+
+  // ---- System Health (Phase 19) ----
+  systemHealth: () => get('/system/health'),
+  subsystemHealth: (name) => get(`/system/health/${name}`),
 
   // ---- Historical Analytics Intelligence (Phase 17) ----
   analyticsHistorical: (params = {}) => {
@@ -204,6 +229,102 @@ export const api = {
   ddsReset: () => postJson('/dds/reset', {}),
   ddsSubprocessStart: () => postJson('/dds/subprocess/start', {}),
   ddsSubprocessStop: () => postJson('/dds/subprocess/stop', {}),
+
+  // GTFS / MTC Transit Data
+  gtfsSummary: () => get('/gtfs/summary'),
+  gtfsRoutes: () => get('/gtfs/routes'),
+  gtfsRouteDetail: (routeId) => get(`/gtfs/routes/${routeId}`),
+  gtfsStops: () => get('/gtfs/stops'),
+  gtfsStopDetail: (stopId) => get(`/gtfs/stops/${stopId}`),
+  gtfsSearch: (q) => get(`/gtfs/search?q=${encodeURIComponent(q)}`),
+  gtfsRoutePolylines: (q, limit = 60) => get(`/gtfs/routes/polylines?q=${encodeURIComponent(q || '')}&limit=${limit}`),
+
+  // Emergency / Public Safety Intelligence
+  emergencySummary: () => get('/emergency/summary'),
+  emergencyFacilities: (type) => get(`/emergency/facilities${type ? `?type=${type}` : ''}`),
+  emergencyFacilityDetail: (id) => get(`/emergency/facilities/${id}`),
+  emergencyNearby: (lat, lon, type, maxResults = 5) => {
+    let url = `/emergency/nearby?lat=${lat}&lon=${lon}&max_results=${maxResults}`
+    if (type) url += `&type=${type}`
+    return get(url)
+  },
+  emergencyIncidentResponse: (data) => postJson('/emergency/incident-response', data),
+  emergencyIncidentResponseById: (id) => postJson(`/emergency/incident-response/${id}`, {}),
+  emergencyTransportImpact: (lat, lon, radius = 3) =>
+    get(`/emergency/transport-impact?lat=${lat}&lon=${lon}&radius=${radius}`),
+  emergencySearch: (q) => get(`/emergency/search?q=${encodeURIComponent(q)}`),
+  emergencyContacts: () => get('/emergency/contacts'),
+
+  // ---- Feature Toggles ----
+  getFeatures: () => get('/features'),
+  toggleFeature: (key, enabled) => postJson('/features', { key, enabled }),
+  updateFeatures: (features) => postJson('/features', { features }),
+
+  // ---- V2 Intelligence APIs ----
+  // Predictive Incident Intelligence
+  v2IncidentPredictionBus: (busId) => get(`/v2/incident-prediction/bus/${encodeURIComponent(busId)}`),
+  v2IncidentPredictionFleet: () => get('/v2/incident-prediction/fleet'),
+
+  // Fleet Decision Intelligence
+  v2FleetDecisions: () => get('/v2/fleet/decisions'),
+
+  // Decision Intelligence (per-event)
+  v2DecisionEvent: (eventId) => get(`/v2/decision/${eventId}`),
+  v2DecisionBus: (busId) => get(`/v2/decision/bus/${encodeURIComponent(busId)}`),
+
+  // Road Corridor Intelligence
+  v2RoadCorridors: () => get('/v2/roads/corridors'),
+  v2RoadCorridor: (id) => get(`/v2/roads/corridor/${id}`),
+
+  // Explainability
+  v2ExplainRisk: (busId) => get(`/v2/explain/risk/${encodeURIComponent(busId)}`),
+  v2ExplainIncidentPrediction: (busId) => get(`/v2/explain/incident-prediction/${encodeURIComponent(busId)}`),
+  v2ExplainDecision: (eventId) => get(`/v2/explain/decision/${eventId}`),
+
+  // Incident Timeline & Replay
+  v2IncidentTimeline: (busId, minutes = 60) => get(`/v2/incident-replay/timeline/${encodeURIComponent(busId)}?minutes=${minutes}`),
+  v2IncidentReplay: (incidentId) => get(`/v2/incident-replay/${incidentId}`),
+
+  // Demand Prediction
+  v2DemandPredict: (minutes = 30) => get(`/v2/demand/predict?minutes=${minutes}`),
+  v2DemandOvercrowding: () => get('/v2/demand/overcrowding'),
+
+  // AI Copilot
+  v2CopilotQuery: (question, context = {}) => postJson('/v2/copilot/query', { question, context }),
+  v2CopilotSuggestions: () => get('/v2/copilot/suggestions'),
+
+  // Phase B: Multi-Source Fusion Engine
+  fusionEvents: (params = {}) => {
+    const q = new URLSearchParams(params).toString()
+    return get(`/fusion/events${q ? '?' + q : ''}`)
+  },
+  fusionStats: () => get('/fusion/stats'),
+  fusionEvaluate: (busId) => postJson('/fusion/evaluate', { bus_id: busId }),
+
+  // Phase D: Route-Level Intelligence
+  routesIntelligence: () => get('/routes/intelligence'),
+  routeIntelligence: (routeCode) => get(`/routes/intelligence/${encodeURIComponent(routeCode)}`),
+  cityOverview: () => get('/routes/city-overview'),
+  routeRecommendations: () => get('/routes/recommendations'),
+
+  // Phase E: Historical Intelligence
+  historicalHotspots: (window = '7d') => get(`/historical/hotspots?window=${window}`),
+  historicalPatterns: (window = '7d') => get(`/historical/patterns?window=${window}`),
+  historicalRoutes: (window = '7d') => get(`/historical/routes?window=${window}`),
+  historicalVehicles: (window = '30d') => get(`/historical/vehicles?window=${window}`),
+  historicalComprehensive: (window = '7d') => get(`/historical/comprehensive?window=${window}`),
+
+  // Vehicle Health: review-to-clear a maintenance entry
+  reviewMaintenance: (bus_id, opts = {}) => postJson('/health/maintenance/review', { bus_id, ...opts }),
+
+  // Phase F: AI Explainability for Events
+  v2ExplainEvent: (eventId) => get(`/v2/explain/event/${encodeURIComponent(eventId)}`),
+
+  // Phase C: Extended Incident Lifecycle
+  confirmIncident: (id, opts = {}) => postJson(`/incidents/${id}/confirm`, opts),
+  assignIncident: (id, assignee, opts = {}) => postJson(`/incidents/${id}/assign`, { assignee }, opts),
+  respondIncident: (id, opts = {}) => postJson(`/incidents/${id}/respond`, {}, opts),
+  incidentSla: () => get('/incidents/sla'),
 }
 
 export function usePoll(fn, intervalMs = 3000, deps = []) {

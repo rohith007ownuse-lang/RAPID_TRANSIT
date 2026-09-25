@@ -333,17 +333,17 @@ class TestPERCLOSCorrectness:
             assert 0.3 < d.perclos < 0.7
 
     def test_perclos_window_rolling(self):
-        """Old timestamps should be evicted after 60s."""
+        """Old timestamps should be evicted after 90s."""
         d = _det()
         now = time.time()
-        # Add 100 timestamps spanning 80 seconds (some old)
+        # Add 100 timestamps spanning 120 seconds (some old)
         for i in range(100):
-            ts = now - 80 + i * 0.8
+            ts = now - 120 + i * 0.8
             d._ear_timestamps.append((ts, 0.10))
         # Process one frame to trigger window cleanup
         with _patch_lm(ear=0.45):
             d.process_frame(_frame())
-        # Window is 60s, so only ~75 of the 100 should remain (plus the new one)
+        # Window is 90s, so only timestamps from the last 90s remain (plus the new one)
         assert len(d._ear_timestamps) < 101
 
     def test_perclos_window_reset_on_no_face(self):
@@ -395,7 +395,7 @@ class TestEventEmission:
 
         with _patch_lm(ear=0.15, mar=0.03) as mocks:
             d.process_frame(_frame())
-            d._eye_closed_start = time.time() - 2.0
+            d._eye_closed_start = time.time() - 2.5
             d.process_frame(_frame())
 
         drowsy = [e for e in events if e["event_type"] == "DRIVER_DROWSINESS"]
@@ -408,7 +408,7 @@ class TestEventEmission:
 
         with _patch_lm(ear=0.15, mar=0.03):
             d.process_frame(_frame())
-            d._eye_closed_start = time.time() - 2.0
+            d._eye_closed_start = time.time() - 2.5
             for _ in range(5):
                 d.process_frame(_frame())
 
@@ -422,7 +422,7 @@ class TestEventEmission:
 
         with _patch_lm(ear=0.15, mar=0.03):
             d.process_frame(_frame())
-            d._eye_closed_start = time.time() - 2.0
+            d._eye_closed_start = time.time() - 2.5
             for _ in range(5):
                 d.process_frame(_frame())
 
@@ -437,7 +437,7 @@ class TestEventEmission:
         # Episode 1: drowsy
         with _patch_lm(ear=0.15, mar=0.03):
             d.process_frame(_frame())
-            d._eye_closed_start = time.time() - 2.0
+            d._eye_closed_start = time.time() - 2.5
             d.process_frame(_frame())
         assert d._alert_issued_for_episode is True
 
@@ -454,7 +454,7 @@ class TestEventEmission:
         # Episode 1
         with _patch_lm(ear=0.15, mar=0.03):
             d.process_frame(_frame())
-            d._eye_closed_start = time.time() - 2.0
+            d._eye_closed_start = time.time() - 2.5
             d.process_frame(_frame())
 
         # Recovery
@@ -464,7 +464,7 @@ class TestEventEmission:
         # Episode 2
         with _patch_lm(ear=0.15, mar=0.03):
             d.process_frame(_frame())
-            d._eye_closed_start = time.time() - 2.0
+            d._eye_closed_start = time.time() - 2.5
             d.process_frame(_frame())
 
         drowsy = [e for e in events if e["event_type"] == "DRIVER_DROWSINESS"]
@@ -724,7 +724,7 @@ class TestIntegration:
         # Simulate drowsy frames
         with _patch_lm(ear=0.15, mar=0.03):
             d.process_frame(_frame())
-            d._eye_closed_start = time.time() - 2.0
+            d._eye_closed_start = time.time() - 2.5
             d.process_frame(_frame())
 
         # Verify events
@@ -786,7 +786,7 @@ class TestIntegration:
 
         with _patch_lm(ear=0.15, mar=0.03):
             d.process_frame(_frame())
-            d._eye_closed_start = time.time() - 2.0
+            d._eye_closed_start = time.time() - 2.5
             d.process_frame(_frame())
 
         for e in events:

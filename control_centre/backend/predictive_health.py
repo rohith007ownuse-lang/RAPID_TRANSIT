@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 from enum import Enum
+import threading
+import time
 
 from data_store import store
 
@@ -55,6 +57,9 @@ THRESHOLDS = {
 }
 
 # Health state thresholds for components
+# Estimated service ticks per day: 1 health tick = 2 sim-minutes, 24h day
+TICKS_PER_DAY = 720
+
 HEALTH_THRESHOLDS = {
     "tyre": {
         "healthy_max": 40,
@@ -135,6 +140,7 @@ class ComponentHealth:
             "trend_per_tick": round(self.trend, 4),
             "rul_ticks": self.rul_ticks,
             "rul_minutes": round(self.rul_ticks * 1.0 / 60, 1) if self.rul_ticks else None,
+            "rul_days": round(self.rul_ticks / TICKS_PER_DAY, 1) if self.rul_ticks else None,
             "history": [round(v, 1) for v in self.history[-20:]] if self.history else [],
             "data_source": self.data_source.value,
             "last_update": self.last_update,
@@ -151,6 +157,7 @@ class VehicleHealth:
     components: Dict[str, ComponentHealth] = field(default_factory=dict)
     anomalies: List[dict] = field(default_factory=list)
     maintenance_recommendations: List[dict] = field(default_factory=list)
+    maintenance_decision: dict = field(default_factory=dict)
     data_source: DataSource = DataSource.SIMULATION
     last_update: str = field(default_factory=utcnow_iso)
     confidence: Optional[float] = None  # None = unknown/unavailable
@@ -163,10 +170,51 @@ class VehicleHealth:
             "components": {name: comp.to_dict() for name, comp in self.components.items()},
             "anomalies": self.anomalies,
             "maintenance_recommendations": self.maintenance_recommendations,
+            "maintenance_decision": self.maintenance_decision,
             "data_source": self.data_source.value,
             "last_update": self.last_update,
             "confidence": self.confidence,
         }
+
+
+def _build_maintenance_decision(health: Dict[str, ComponentHealth]) -> dict:
+    """Decide send-to-maintenance / continue based on shortest RUL among degraded components.
+
+    Heuristic (display only): components that have already breached a threshold and
+    carry a shortening RUL reveal 'how many days this vehicle can still run'.
+    """
+    candidates = []
+    for name, comp in health.items():
+        state = comp.get_health_state()
+        if state in (HealthState.WARNING, HealthState.CRITICAL) and comp.rul_ticks:
+            candidates.append((comp.rul_ticks / TICKS_PER_DAY, name, comp))
+
+    if not candidates:
+        return {
+            "status": "CAN_CONTINUE",
+            "days_to_failure": None,
+            "component": None,
+            "reason": "No component currently at a warning/critical level — vehicle can continue.",
+        }
+
+    min_days, worst_component, worst_comp = min(candidates, key=lambda c: c[0])
+    if min_days <= 1.0:
+        status = "SEND_TO_MAINTENANCE"
+        reason = f"{worst_component} reaches failure within ~{min_days:.1f}d — dispatch to maintenance now."
+    elif min_days <= 3.0:
+        status = "PLAN_MAINTENANCE"
+        reason = f"{worst_component} reaches failure within ~{min_days:.1f}d — plan maintenance within 3 days."
+    else:
+        status = "CAN_CONTINUE"
+        reason = f"{worst_component} can keep running ~{min_days:.1f}d before any component fails."
+
+    return {
+        "status": status,
+        "days_to_failure": round(min_days, 1),
+        "component": worst_component,
+        "worst_component_state": worst_comp.get_health_state().value,
+        "reason": reason,
+    }
 
 
 class VehicleHealthTracker:
@@ -196,43 +244,64 @@ class VehicleHealthTracker:
         """Calculate degradation increments for each component based on bus telemetry."""
         increments = {}
         bid = bus["bus_id"]
+        health = self.get_or_create(bid, data_source)
 
-        # Tyre wear: accumulates with distance & low pressure
+        # Tyre wear: accumulates with distance & low pressure.
+        # Wear-rate budget: only attention-fleet vehicles accrue meaningful
+        # wear; the rest of the fleet decays towards a healthy baseline so a
+        # 300-vehicle fleet does not light up vehicle-by-vehicle over a long
+        # demo run.
+        attention = bool(bus.get("_attention"))
         wheels = bus.get("wheels", [85, 85, 85, 85])
         tyre_names = ["tyre_fl", "tyre_fr", "tyre_rl", "tyre_rr"]
         for i, name in enumerate(tyre_names):
             psi = float(wheels[i] if i < len(wheels) else 85)
             # low pressure accelerates wear; base wear per tick
             pressure_factor = 1.0 + max(0.0, (85.0 - psi) / 85.0) * 0.5
-            increment = rng.uniform(0.03, 0.08) * pressure_factor
+            if attention:
+                increment = rng.uniform(0.03, 0.08) * pressure_factor
+            else:
+                # healthy fleet: wear no faster than routine service erases it
+                increment = min(rng.uniform(0.0, 0.01) * pressure_factor, -0.005)
             increments[name] = increment
 
-        # Vibration: rises with anomalies, potholes, tyre wear
+        # Vibration: rises with anomalies, potholes, tyre wear.
+        # Vibration drift also carries a wear-rate budget: healthy vehicles
+        # decay towards baseline, attention vehicles drift up.
         v = bus.get("vehicle", {})
         vib_base = float(v.get("vibration", 0.2))
         avg_tyre = sum(float(w) for w in wheels) / len(wheels)
         tyre_imbalance = max(0.0, (85.0 - avg_tyre) / 85.0) * 0.3
-        vib_increment = rng.uniform(0.005, 0.02) + tyre_imbalance * 0.01
+        if attention:
+            vib_increment = rng.uniform(0.005, 0.02) + tyre_imbalance * 0.01
+        else:
+            # pull the counter back down to a healthy equilibrium
+            vib_increment = -min(0.01, health["vibration"].value * 0.05) if health["vibration"].value > 0.2 else 0.0
         if v.get("anomaly") and v.get("anomaly") != "none":
             vib_increment += 0.02
             # Track anomaly
-            health = self.get_or_create(bid, data_source)
             health["vibration"].anomaly_count += 1
         increments["vibration"] = vib_increment
 
-        # Harsh braking: occasional hard stops
-        if rng.random() < 0.02:
-            increments["harsh_braking"] = 1.0
+        # Harsh braking: occasional hard stops. Increment is scaled to the
+        # component's thresholds (healthy 0.02 / watch 0.05 / warning 0.10):
+        # one hard stop is a WATCH-level blip that decays away, while repeated
+        # stops without recovery push the counter into WARNING/CRITICAL.
+        # (Previously a single event added 1.0 — instantly CRITICAL on every
+        # vehicle, flooding the fleet with fault alerts.)
+        if rng.random() < (0.06 if attention else 0.01):
+            increments["harsh_braking"] = 0.04
         else:
-            # slow decay when no harsh braking
-            increments["harsh_braking"] = -0.01
+            # decay when no harsh braking — fast enough that an isolated blip
+            # on a healthy vehicle fades before it can pile up to WARNING
+            increments["harsh_braking"] = -0.02
 
         # Energy degradation: EV battery degrades faster than diesel fuel system
         energy = bus.get("energy", {})
         if energy.get("type") == "EV":
-            deg_increment = rng.uniform(0.008, 0.015)
+            deg_increment = rng.uniform(0.008, 0.015) if attention else rng.uniform(0.0, 0.003)
         else:
-            deg_increment = rng.uniform(0.002, 0.006)
+            deg_increment = rng.uniform(0.002, 0.006) if attention else rng.uniform(-0.002, 0.001)
         increments["energy_degradation"] = deg_increment
 
         return increments
@@ -476,6 +545,7 @@ class VehicleHealthTracker:
             components=health,
             anomalies=anomalies,
             maintenance_recommendations=recommendations,
+            maintenance_decision=_build_maintenance_decision(health),
             data_source=data_source,
             last_update=utcnow_iso(),
             confidence=None,  # heuristic, no confidence
@@ -496,6 +566,10 @@ class VehicleHealthTracker:
 
 
 health_tracker = VehicleHealthTracker()
+
+# Per-(bus, component) cooldown for VEHICLE_ANOMALY alert emission.
+ANOMALY_ALERT_COOLDOWN_S = 600.0
+_ANOMALY_ALERT_AT = {}
 
 
 def tick_all(buses: list, rng: random.Random, data_source: DataSource = DataSource.SIMULATION) -> Dict[str, list]:
@@ -541,23 +615,81 @@ def get_fleet_health_summary(data_source: DataSource = DataSource.SIMULATION) ->
     return summary
 
 
-def generate_health_events(data_source: DataSource = DataSource.SIMULATION) -> List[dict]:
-    """Generate vehicle health events from current health state.
+def get_fleet_maintenance_risk(data_source: DataSource = DataSource.SIMULATION) -> dict:
+    """Fleet-wide maintenance risk ordering for the analytics page.
 
-    Creates VEHICLE_ANOMALY events for components in WARNING or CRITICAL state.
-    Events are added to the store (which triggers alerts via data_store.add_event).
+    Buses are ranked by the shortest predicted days-to-failure across their
+    degraded components. 'at_risk' contains buses that need action within 3 days.
     """
+    entries = []
+    for bus in store.get_buses():
+        bid = bus["bus_id"]
+        vh = health_tracker.get_vehicle_health(bid, data_source)
+        decision = vh.maintenance_decision
+        entries.append({
+            "bus_id": bid,
+            "reg_no": bus.get("reg_no", ""),
+            "overall_state": vh.overall_state.value,
+            "status": decision.get("status", "CAN_CONTINUE"),
+            "days_to_failure": decision.get("days_to_failure"),
+            "worst_component": decision.get("component"),
+            "reason": decision.get("reason", ""),
+        })
+    entries.sort(key=lambda e: (e["days_to_failure"] if e["days_to_failure"] is not None else float("inf")))
+    at_risk = [e for e in entries if e["status"] in ("PLAN_MAINTENANCE", "SEND_TO_MAINTENANCE")]
+    return {"fleet_size": len(entries), "at_risk": at_risk, "buses": entries}
+
+
+def generate_health_events(data_source: DataSource = DataSource.SIMULATION) -> List[dict]:
+    """Vehicle-health alert generation — RETIRED.
+
+    VEHICLE_ANOMALY events were removed from the alert pipeline: they flooded
+    Live Alerts and the incidents page with low-value noise. Vehicle
+    degradation is still fully computed and visible through the health
+    endpoints (fleet predictive health, per-bus health countdown, Vehicle
+    Health page) — it just no longer creates alert events.
+
+    Kept as a no-op so existing call sites (simulator tick) and imports stay
+    valid. If real-time vehicle anomaly alerting is ever wanted again, restore
+    the previous implementation and re-add "VEHICLE_ANOMALY" to alerts.py's
+    WARNING_ALERT_TYPES.
+    """
+    return []
+
+
+def _retired_generate_health_events_impl(data_source: DataSource = DataSource.SIMULATION) -> List[dict]:
+    """Original implementation, kept for reference (unused)."""
     from data_store import store
     buses = store.get_buses()
     events = []
+    now = time.time()
 
     for bus in buses:
         bid = bus["bus_id"]
         vh = health_tracker.get_vehicle_health(bid, data_source)
 
+        # Error-budget gate: only attention-fleet vehicles and live nodes
+        # raise VEHICLE_ANOMALY alerts. The simulated healthy fleet can show
+        # transient WATCH/WARNING component states internally, but those must
+        # not flood the alert feed — that is reserved for the ~10 attention
+        # vehicles (see simulator._attention) and real live telemetry.
+        if not (bus.get("_attention") or bus.get("_live") or data_source == DataSource.LIVE):
+            continue
+
         for anomaly in vh.anomalies:
             # Only generate event for WARNING and CRITICAL (not WATCH)
             if anomaly["health_state"] in ("WARNING", "CRITICAL"):
+                # per-(bus, component) cooldown: one alert per component per
+                # 10 minutes so an unattended fault stays visible without spam
+                key = (bid, anomaly["component"])
+                last = _ANOMALY_ALERT_AT.get(key, 0.0)
+                if now - last < ANOMALY_ALERT_COOLDOWN_S:
+                    continue
+                _ANOMALY_ALERT_AT[key] = now
+                if len(_ANOMALY_ALERT_AT) > 2000:
+                    # keep the dedup map bounded (drop oldest half)
+                    for k in sorted(_ANOMALY_ALERT_AT, key=_ANOMALY_ALERT_AT.get)[:len(_ANOMALY_ALERT_AT) // 2]:
+                        _ANOMALY_ALERT_AT.pop(k, None)
                 event = {
                     "bus_id": bid,
                     "reg_no": bus.get("reg_no", ""),

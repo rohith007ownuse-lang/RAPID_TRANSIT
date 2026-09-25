@@ -55,6 +55,14 @@ SLOT_CABIN = "cabin"
 SLOT_ROAD = "road"
 ALL_SLOTS = [SLOT_DRIVER, SLOT_CABIN, SLOT_ROAD]
 
+# Pipeline rates: video is delivered at the full camera rate (30 fps target)
+# while heavy AI inference (MediaPipe/YOLO) runs asynchronously at ~10 Hz.
+# Overlays (boxes/stats/face mesh) are redrawn onto every fresh frame from the
+# latest inference, so motion stays at 30 fps and AI refreshes at 10 Hz.
+VIDEO_FRAME_INTERVAL = 1.0 / 30.0
+AI_INFERENCE_INTERVAL = 0.1
+MESH_MAX_AGE_SEC = 0.5
+
 _SLOT_META = {
     SLOT_DRIVER: {
         "camera_id": "CAM-DRV-001", "camera_type": "driver",
@@ -110,6 +118,15 @@ class CameraSource:
         self.cap = None
         self.thread = None
         self.running = False
+        # Async AI worker (inference off the frame-delivery path)
+        self.detect_thread = None
+        self.detect_running = False
+        # Driver face-mesh snapshot: (meshed_frame, bool_mask, timestamp).
+        # Lets the 30 fps video thread composite the 10 Hz mesh with no flicker.
+        self.mesh_lock = threading.Lock()
+        self.mesh_frame = None
+        self.mesh_mask = None
+        self.mesh_time = 0.0
         self.frame = None
         self.annotated_frame = None
         self.frame_lock = threading.Lock()
@@ -117,6 +134,18 @@ class CameraSource:
         self.measured_fps = None
         self._frames_in_window = 0
         self._fps_window_start = time.monotonic()
+        # Pre-encoded JPEG base64 cache — avoids re-encoding per REST request
+        self._encoded_b64 = None
+        self._encoded_lock = threading.Lock()
+        # Monotonic frame counter — lets streamers skip re-sending the same
+        # frame (smooth delivery without redundant bandwidth/CPU).
+        self.frame_seq = 0
+        # Shared-camera fallback (single-webcam machines): when this slot has
+        # no physical device of its own, it mirrors another slot's frames
+        # instead of reporting DISCONNECTED. No synthetic frames — the shared
+        # flag is reported honestly in status so the UI can label it.
+        self.shared_with = None
+        self.shared = False
 
     def device_num(self):
         """Consumer-facing device label (int for an index, str for a path)."""
@@ -157,6 +186,8 @@ class CameraManager:
         # AI modules (lazy loaded)
         self._driver_detector = None
         self._pothole_detector = None
+        self._traffic_detector = None
+        self._pedestrian_detector = None
         self._cabin_detector = None
 
         # Detection results per slot
@@ -225,6 +256,22 @@ class CameraManager:
             except Exception as e:
                 print(f"[camera_manager] Pothole detector failed: {e}")
 
+        if self._traffic_detector is None:
+            try:
+                from ai.road.traffic_detector import traffic_detector as _traffic
+                self._traffic_detector = _traffic
+                print("[camera_manager] Traffic detector linked (shared singleton)")
+            except Exception as e:
+                print(f"[camera_manager] Traffic detector failed: {e}")
+
+        if self._pedestrian_detector is None:
+            try:
+                from ai.road.pedestrian_detector import pedestrian_detector as _ped
+                self._pedestrian_detector = _ped
+                print("[camera_manager] Pedestrian detector linked (shared singleton)")
+            except Exception as e:
+                print(f"[camera_manager] Pedestrian detector failed: {e}")
+
         if self._cabin_detector is None:
             try:
                 from ai.cabin.cabin_detector import cabin_detector as _cabin
@@ -278,6 +325,35 @@ class CameraManager:
                 return False, f"Camera for slot '{test_slot}' is disabled via configuration"
 
             ok, msg = self._start_source_locked(src)
+            if not ok and test_slot != SLOT_DRIVER:
+                # Single webcam machines: cabin/road slots have their own
+                # device index (e.g. cabin=1) which often doesn't exist.
+                # Test mode means ONE shared camera feeding one AI module
+                # at a time, so fall back to the driver device (usually 0)
+                # or the already pre-opened shared cap instead of failing.
+                fallback = _resolve_camera_device(SLOT_DRIVER)
+                if fallback is None:
+                    fallback = 0
+                if src.device_index != fallback:
+                    orig = src.device_index
+                    src.device_index = fallback
+                    src.error = None
+                    # Reuse the pre-opened shared camera when available —
+                    # avoids re-opening the same USB device twice in a row.
+                    if self._cap is not None:
+                        try:
+                            if self._cap.isOpened():
+                                src.cap = self._cap
+                        except Exception:
+                            pass
+                    ok2, msg2 = self._start_source_locked(src)
+                    if ok2:
+                        print(f"[camera_manager] {test_slot} fell back "
+                              f"to shared camera {fallback!r} (own device {orig!r} unavailable)")
+                        ok, msg = ok2, msg2
+                    else:
+                        src.device_index = orig
+                        msg = f"{msg}; shared-camera fallback ({fallback!r}) also failed: {msg2}"
             if not ok:
                 return False, msg
 
@@ -305,6 +381,10 @@ class CameraManager:
             unavailable = []
             for slot in (SLOT_DRIVER, SLOT_CABIN):
                 src = self._get_source(slot)
+                # A previously-shared fallback must be cleared before a fresh start
+                # attempt, otherwise a stale shared flag could mask a real device.
+                src.shared_with = None
+                src.shared = False
                 if not src.enabled:
                     unavailable.append(slot)
                     continue
@@ -313,6 +393,11 @@ class CameraManager:
                     started.append(slot)
                 else:
                     unavailable.append(slot)
+
+            # No shared-camera fallback: the driver feed is DDS + face-presence
+            # ONLY and must never be counted as passengers. When the cabin
+            # camera has no device of its own it reports DISCONNECTED honestly
+            # (with null counts) instead of mirroring the driver feed.
 
             if not started:
                 self._mode = "stopped"
@@ -363,19 +448,30 @@ class CameraManager:
         src.state = "CONNECTED"
         src.thread = threading.Thread(target=self._capture_loop, args=(src,), daemon=True)
         src.thread.start()
+        # Async inference worker: heavy AI runs at ~10 Hz on frame copies so
+        # the capture loop sustains the full 30 fps video rate.
+        src.detect_running = True
+        src.detect_thread = threading.Thread(target=self._detection_loop, args=(src,), daemon=True)
+        src.detect_thread.start()
         # Register the running source so non-test mode status/is_slot_active see it.
         self._cameras[src.slot] = src
         return True, "ok"
 
     def _capture_loop(self, src):
-        """Background thread for a single camera: read frame, detect, store.
+        """Background thread for a single camera: read frame, overlay, store.
+
+        Video delivery only — runs at the full camera rate (30 fps target).
+        Heavy AI inference runs in `_detection_loop` at ~10 Hz; this loop
+        redraws the latest results (boxes/stats/face mesh) onto every fresh
+        frame, so motion stays smooth while AI refreshes asynchronously.
 
         Errors are contained to this camera's source: a failed read or an
         exception in one loop never stops the other cameras' threads.
         """
-        print(f"[camera_manager] Capture loop started for {src.slot}")
+        print(f"[camera_manager] Capture loop started for {src.slot} (30 fps video)")
         while src.running and src.cap is not None and src.cap.isOpened():
             try:
+                loop_start = time.monotonic()
                 ret, frame = src.cap.read()
                 if not ret:
                     if src.error is None:
@@ -384,49 +480,258 @@ class CameraManager:
                     continue
 
                 src.error = None
+                # Phase 19: Reset state to CONNECTED on successful frame
+                if src.state != "CONNECTED":
+                    src.state = "CONNECTED"
+                    # Phase 19: Record camera recovery for health tracking
+                    try:
+                        from system_health import record_subsystem_success
+                        camera_name = f"{src.slot}_camera"
+                        record_subsystem_success(camera_name)
+                    except ImportError:
+                        pass
 
-                # Store raw frame for this camera
+                # Store raw frame for this camera (kept clean for consumers
+                # like the cabin occupancy engine — overlays go on a copy).
                 with src.frame_lock:
-                    src.frame = frame.copy()
+                    src.frame = frame
                 src.last_frame_time = time.time()
 
                 # Track this camera's real frame rate (measured, not assumed)
                 src._track_fps()
 
-                # Run detection for this slot
-                self._run_detection(frame, src.slot)
+                # Cheap overlay redraw from the latest async inference results.
+                annotated = frame.copy()
+                self._redraw_overlay(annotated, src)
+                with src.frame_lock:
+                    src.annotated_frame = annotated
+
+                # Pre-encode the annotated frame to JPEG base64 in the capture
+                # thread so the REST handler never re-encodes per request.
+                self._pre_encode(src)
 
                 # Keep the per-camera annotated copy clean (keyed by slot, so
                 # another camera writing its own annotation cannot corrupt ours).
                 with self._frame_lock:
-                    per_slot = self._slot_annotated.get(src.slot)
-                    if per_slot is not None:
-                        src.annotated_frame = per_slot
+                    self._annotated_frame = annotated
+                    self._slot_annotated[src.slot] = annotated
 
-                # Mirror the primary capture into the legacy view.
+                # Mirror FPS for legacy view.
                 if src.slot == self._active_slot:
-                    with self._frame_lock:
-                        self._frame = frame.copy()
                     with self._lock:
                         self._measured_fps = src.measured_fps
 
-                # Rate cap: never busy-spin. Detection itself takes most of the
-                # frame budget; max ~30 fps.
-                time.sleep(0.03)
+                # Pace to the 30 fps video target (never busy-spin).
+                elapsed = time.monotonic() - loop_start
+                time.sleep(max(0.001, VIDEO_FRAME_INTERVAL - elapsed))
 
             except Exception as e:
                 print(f"[camera_manager] {src.slot} capture loop error: {e}")
                 src.error = str(e)
+                # Phase 19: Update source state on error for honest status reporting
+                if src.state == "CONNECTED":
+                    src.state = "ERROR"
+                # Phase 19: Record camera failure for health tracking
+                try:
+                    from system_health import record_subsystem_failure
+                    camera_name = f"{src.slot}_camera"
+                    record_subsystem_failure(camera_name, str(e), critical=False)
+                except ImportError:
+                    pass
                 time.sleep(0.1)
 
         print(f"[camera_manager] Capture loop ended for {src.slot}")
 
+    def _detection_loop(self, src):
+        """Async AI worker: inference at ~10 Hz on frame copies.
+
+        Runs the slot's detector (MediaPipe/YOLO) off the video path and
+        publishes results + the driver face-mesh snapshot for the capture
+        loop to composite onto every 30 fps frame.
+        """
+        print(f"[camera_manager] Detection loop started for {src.slot} (~10 Hz AI)")
+        while src.detect_running:
+            try:
+                tick = time.monotonic()
+                with src.frame_lock:
+                    raw = src.frame
+                if raw is not None and src.cap is not None:
+                    try:
+                        work = raw.copy()
+                    except Exception:
+                        work = None
+                    if work is not None:
+                        # Inference + result store; draws mesh on the throwaway
+                        # copy (never touches the live raw frame).
+                        self._run_detection(work, src.slot, publish=False)
+                        if src.slot == SLOT_DRIVER:
+                            self._store_mesh_snapshot(src, raw, work)
+                elapsed = time.monotonic() - tick
+                time.sleep(max(0.01, AI_INFERENCE_INTERVAL - elapsed))
+            except Exception as e:
+                print(f"[camera_manager] {src.slot} detection loop error: {e}")
+                time.sleep(0.2)
+        print(f"[camera_manager] Detection loop ended for {src.slot}")
+
+    def _store_mesh_snapshot(self, src, base, meshed):
+        """Cache which pixels the DDS mesh drew, for 30 fps compositing.
+
+        The mesh belongs to a ~10 Hz inference tick; the video thread stamps
+        these pixels onto each fresh frame (no flicker, mild ghosting only
+        during fast motion). Strictly validated — never stores garbage.
+        """
+        try:
+            import numpy as _np
+            diff = cv2.absdiff(meshed, base)
+            mask = diff.max(axis=2) > 12
+            if not isinstance(mask, _np.ndarray) or mask.shape != base.shape[:2]:
+                return
+            if not isinstance(meshed, _np.ndarray) or meshed.shape != base.shape:
+                return
+            if not bool(mask.any()):
+                # No mesh drawn (e.g. NO FACE) — clear any stale snapshot.
+                with src.mesh_lock:
+                    src.mesh_frame = None
+                    src.mesh_mask = None
+                    src.mesh_time = 0.0
+                return
+            with src.mesh_lock:
+                src.mesh_frame = meshed
+                src.mesh_mask = mask
+                src.mesh_time = time.monotonic()
+        except Exception:
+            pass
+
+    def _redraw_overlay(self, annotated, src):
+        """Draw the latest async inference results onto a fresh frame.
+
+        Cheap OpenCV primitives only (text/boxes + cached mesh pixels) —
+        safe to run at the full 30 fps video rate.
+        """
+        slot = src.slot
+        if slot == SLOT_DRIVER:
+            mesh = None
+            with src.mesh_lock:
+                if (src.mesh_frame is not None and src.mesh_mask is not None
+                        and (time.monotonic() - src.mesh_time) < MESH_MAX_AGE_SEC):
+                    try:
+                        if src.mesh_frame.shape == annotated.shape \
+                                and src.mesh_mask.shape == annotated.shape[:2]:
+                            mesh = (src.mesh_frame, src.mesh_mask)
+                    except Exception:
+                        mesh = None
+            if mesh is not None:
+                try:
+                    mframe, mmask = mesh
+                    annotated[mmask] = mframe[mmask]
+                except Exception:
+                    pass
+            with self._detection_lock:
+                result = self._detection_results.get(SLOT_DRIVER) or {}
+            if isinstance(result, dict) and result:
+                try:
+                    self._draw_driver(annotated, result)
+                except Exception:
+                    pass
+            # Driver slot is DDS + face-presence ONLY: never draw passenger/
+            # person-count overlays here. People counting lives on the cabin
+            # slot (occupancy engine + cabin detector overlay below).
+        elif slot == SLOT_ROAD:
+            with self._detection_lock:
+                dets = self._detection_results.get(SLOT_ROAD) or []
+            try:
+                # Separate pothole / traffic / pedestrian detections
+                pothole_dets = [d for d in dets if d.get("class_name") == "pothole"]
+                traffic_dets = [d for d in dets if d.get("class_name") in ("car", "bus", "truck", "motorcycle")]
+                ped_dets = [d for d in dets if d.get("class_name") == "pedestrian"]
+                if pothole_dets:
+                    self._draw_potholes(annotated, pothole_dets)
+                if traffic_dets and self._traffic_detector:
+                    self._traffic_detector.draw_overlay(annotated, traffic_dets)
+                if ped_dets and self._pedestrian_detector:
+                    self._pedestrian_detector.draw_overlay(annotated, ped_dets)
+            except Exception:
+                pass
+        elif slot == SLOT_CABIN:
+            with self._detection_lock:
+                dets = self._detection_results.get(SLOT_CABIN) or []
+            try:
+                if self._cabin_detector is not None:
+                    self._cabin_detector.draw_overlay(annotated, list(dets))
+            except Exception:
+                pass
+            # YOLO person-count overlay: green boxes + passenger count so the
+            # operator SEES detection working (previously only fire/smoke drew).
+            try:
+                self._draw_person_boxes(annotated)
+            except Exception:
+                pass
+
+    def _draw_person_boxes(self, frame):
+        """Overlay the latest YOLO person boxes + passenger count (cheap).
+
+        Reads the cabin occupancy snapshot the occupancy engine publishes on
+        the PROTO-001 bus — no extra inference here, just drawing. No boxes
+        means nothing is drawn (never fabricates detections).
+        """
+        if cv2 is None:
+            return
+        boxes, count = None, None
+        try:
+            from data_store import store as _store
+            bus = _store.get_bus(_bus_id())
+            snap = (bus or {}).get("cabin_occupancy") or {}
+            boxes = snap.get("person_boxes")
+            count = snap.get("occupancy_count")
+        except Exception:
+            return
+        if not boxes:
+            if count is not None:
+                try:
+                    cv2.putText(frame, f"Passengers: {count}", (10, 58),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                except Exception:
+                    pass
+            return
+        try:
+            h, w = frame.shape[:2]
+            for b in boxes:
+                try:
+                    x1, y1, x2, y2 = [int(v) for v in b[:4]]
+                except Exception:
+                    continue
+                x1 = max(0, min(w - 1, x1)); x2 = max(0, min(w - 1, x2))
+                y1 = max(0, min(h - 1, y1)); y2 = max(0, min(h - 1, y2))
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            label = f"Passengers: {count}" if count is not None else f"Persons: {len(boxes)}"
+            cv2.putText(frame, label, (10, 58),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        except Exception:
+            pass
+
     def _stop_source(self, src):
-        """Stop a single camera: halt its thread, release only its own cap."""
+        """Stop a single camera: halt its threads, release only its own cap."""
+        # A shared-fallback slot owns no device/threads — just clear the alias
+        # so a later start re-probes the real device instead of going stale.
+        if getattr(src, "shared_with", None):
+            src.shared_with = None
+            src.shared = False
+            src.state = "STOPPED"
+            src.error = None
+            src.last_frame_time = None
+            return
         src.running = False
+        src.detect_running = False
         if src.thread is not None:
             src.thread.join(timeout=2.0)
             src.thread = None
+        if src.detect_thread is not None:
+            src.detect_thread.join(timeout=2.0)
+            src.detect_thread = None
+        with src.mesh_lock:
+            src.mesh_frame = None
+            src.mesh_mask = None
+            src.mesh_time = 0.0
         if src.cap is not None:
             if src.cap is not self._cap:
                 # The primary cap is released exactly once by _stop_capture.
@@ -438,8 +743,13 @@ class CameraManager:
         with src.frame_lock:
             src.frame = None
             src.annotated_frame = None
+        with src._encoded_lock:
+            src._encoded_b64 = None
         src.measured_fps = None
         src.last_frame_time = None
+        src.frame_seq = 0
+        src.shared_with = None
+        src.shared = False
         if src.state in ("CONNECTED", "STARTING"):
             src.state = "STOPPED"
 
@@ -524,56 +834,88 @@ class CameraManager:
             self._mode = "stopped"
         print("[camera_manager] Stopped")
 
-    def _run_detection(self, frame, slot):
-        """Run AI detection on a frame (called from the capture loop).
+    def _run_detection(self, frame, slot, publish=True):
+        """Run AI detection on a frame and store the results.
 
-        The annotated frame is copied AFTER detection so overlays the detectors
-        draw onto the raw frame (e.g. the DDS face mesh, mouth points) appear
-        in the streamed image — copying first used to drop them.
+        With publish=True (default) the annotated frame is also published to
+        the stream cache (legacy synchronous path). The async detection worker
+        calls with publish=False — results are stored for the 30 fps video
+        thread to redraw, and the passed frame is just a throwaway working
+        copy carrying the freshly-drawn mesh for the snapshot.
         """
         if slot == SLOT_DRIVER and self._driver_detector:
             try:
                 result = self._driver_detector.process_frame(frame)  # draws mesh on frame
                 with self._detection_lock:
                     self._detection_results[SLOT_DRIVER] = result
-                annotated = frame.copy()
-                self._draw_driver(annotated, result)
-                with self._frame_lock:
-                    self._annotated_frame = annotated
-                    self._slot_annotated[SLOT_DRIVER] = annotated
+                if publish:
+                    annotated = frame.copy()
+                    self._draw_driver(annotated, result)
+                    with self._frame_lock:
+                        self._annotated_frame = annotated
+                        self._slot_annotated[SLOT_DRIVER] = annotated
                 return result
             except Exception as e:
                 print(f"[camera_manager] Driver detect error: {e}")
 
-        elif slot == SLOT_ROAD and self._pothole_detector:
+        elif slot == SLOT_ROAD and (self._pothole_detector or self._traffic_detector or self._pedestrian_detector):
             try:
-                detections = self._pothole_detector.detect(frame)
+                # Run pothole + traffic + pedestrian detection on the road cam.
+                pothole_dets = self._pothole_detector.detect(frame) if self._pothole_detector else []
+                traffic_dets = self._traffic_detector.detect(frame) if self._traffic_detector else []
+                # Pedestrian detection on a reduced cadence: three concurrent
+                # YOLO passes on every frame is wasteful, so the slow pedestrians
+                # pass runs every PEDESTRIAN_SKIP frames while traffic/potholes
+                # stay at full rate.
+                self._pedestrian_counter = getattr(self, "_pedestrian_counter", 0) + 1
+                ped_dets = []
+                if self._pedestrian_detector and self._pedestrian_counter % 6 == 0:
+                    ped_dets = self._pedestrian_detector.detect(frame) or []
+                    self._last_pedestrian_dets = ped_dets
+                else:
+                    ped_dets = list(getattr(self, "_last_pedestrian_dets", []) or [])
+                # Only store the real per-frame types in detection_results so the
+                # redraw layer can split them cleanly (pothole / vehicle / person).
+                combined = list(pothole_dets) + list(traffic_dets) + [dict(d) for d in ped_dets]
                 with self._detection_lock:
-                    self._detection_results[SLOT_ROAD] = detections
-                annotated = frame.copy()
-                self._draw_potholes(annotated, detections)
-                with self._frame_lock:
-                    self._annotated_frame = annotated
-                    self._slot_annotated[SLOT_ROAD] = annotated
+                    self._detection_results[SLOT_ROAD] = combined
+
+                if publish:
+                    annotated = frame.copy()
+                    # Draw all overlays
+                    if pothole_dets:
+                        self._draw_potholes(annotated, pothole_dets)
+                    if traffic_dets and self._traffic_detector:
+                        self._traffic_detector.draw_overlay(annotated, traffic_dets)
+                    if ped_dets and self._pedestrian_detector:
+                        self._pedestrian_detector.draw_overlay(annotated, ped_dets)
+                    with self._frame_lock:
+                        self._annotated_frame = annotated
+                        self._slot_annotated[SLOT_ROAD] = annotated
             except Exception as e:
-                print(f"[camera_manager] Pothole detect error: {e}")
-                with self._frame_lock:
-                    self._annotated_frame = frame.copy()
-                    self._slot_annotated[SLOT_ROAD] = frame.copy()
+                print(f"[camera_manager] Road detect error: {e}")
+                if publish:
+                    with self._frame_lock:
+                        self._annotated_frame = frame.copy()
+                        self._slot_annotated[SLOT_ROAD] = frame.copy()
 
         elif slot == SLOT_CABIN and self._cabin_detector:
             try:
                 detections = self._cabin_detector.process_frame(frame)
                 with self._detection_lock:
                     self._detection_results[SLOT_CABIN] = detections
-                with self._frame_lock:
-                    self._annotated_frame = frame.copy()
-                    self._slot_annotated[SLOT_CABIN] = frame.copy()
+                if publish:
+                    annotated = frame.copy()
+                    self._cabin_detector.draw_overlay(annotated, detections)
+                    with self._frame_lock:
+                        self._annotated_frame = annotated
+                        self._slot_annotated[SLOT_CABIN] = annotated
             except Exception as e:
                 print(f"[camera_manager] Cabin detect error: {e}")
-                with self._frame_lock:
-                    self._annotated_frame = frame.copy()
-                    self._slot_annotated[SLOT_CABIN] = frame.copy()
+                if publish:
+                    with self._frame_lock:
+                        self._annotated_frame = frame.copy()
+                        self._slot_annotated[SLOT_CABIN] = frame.copy()
 
     def _draw_driver(self, frame, result):
         """Draw drowsiness overlay on frame."""
@@ -632,8 +974,26 @@ class CameraManager:
     @staticmethod
     def _encode_frame(annotated):
         import base64
-        _, buffer = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        _, buffer = cv2.imencode('.jpg', annotated, [cv2.IMWRITE_JPEG_QUALITY, 60])
         return base64.b64encode(buffer).decode('utf-8')
+
+    def _pre_encode(self, src):
+        """Pre-encode the annotated frame to JPEG base64 in the capture thread.
+
+        Called once per frame after detection — the REST handler just reads
+        the cached string, never re-encodes.
+        """
+        with src.frame_lock:
+            frame = src.annotated_frame if src.annotated_frame is not None else src.frame
+        if frame is None:
+            return
+        try:
+            b64 = self._encode_frame(frame)
+            with src._encoded_lock:
+                src._encoded_b64 = b64
+            src.frame_seq += 1
+        except Exception:
+            pass
 
     def get_frame_as_base64(self, slot=None):
         if not _import_cv2():
@@ -644,34 +1004,84 @@ class CameraManager:
             if not target_slot or target_slot != self._active_slot:
                 return None
 
-            # Use annotated frame from background detection thread
+            src = self._sources.get(target_slot)
+            # Return pre-encoded cache if available (no lock on hot path)
+            if src is not None:
+                with src._encoded_lock:
+                    cached = src._encoded_b64
+                if cached is not None:
+                    return cached
+
+            # Fallback: encode on demand
             with self._frame_lock:
                 annotated = self._annotated_frame if self._annotated_frame is not None else self._frame
-
             if annotated is None:
                 return None
             return self._encode_frame(annotated)
 
         # Multi-camera / non-test mode: return that camera's own latest frame.
+        # A shared-fallback cabin mirrors the driver camera's frame.
         target_slot = slot
         src = self._sources.get(target_slot)
         if src is None:
             return None
+        if getattr(src, "shared_with", None):
+            donor = self._sources.get(src.shared_with)
+            if donor is None:
+                return None
+            with donor._encoded_lock:
+                cached = donor._encoded_b64
+            if cached is not None:
+                return cached
+            with donor.frame_lock:
+                frame = donor.annotated_frame if donor.annotated_frame is not None else donor.frame
+            if frame is None:
+                return None
+            return self._encode_frame(frame)
+        # Return pre-encoded cache if available
+        with src._encoded_lock:
+            cached = src._encoded_b64
+        if cached is not None:
+            return cached
+        # Fallback: encode on demand
         with src.frame_lock:
             frame = src.annotated_frame if src.annotated_frame is not None else src.frame
         if frame is None:
             return None
         return self._encode_frame(frame)
 
+    def get_frame_seq(self, slot):
+        """Monotonic frame counter for a slot (-1 when the slot is inactive).
+
+        Streamers compare this against the last-sent value and skip
+        re-sending an unchanged frame, which keeps motion smooth without
+        burning bandwidth on duplicates.
+        """
+        if self._test_mode and slot != self._active_slot:
+            return -1
+        src = self._sources.get(slot)
+        if src is None:
+            return -1
+        if not self._test_mode and slot not in self._cameras:
+            return -1
+        return src.frame_seq
+
     def get_latest_frame(self, slot):
         """Return the raw latest frame for a slot (no new capture thread).
 
         Used by the cabin occupancy engine: it consumes the frame this camera's
         own capture loop already produced, so perception never reopens devices.
+        A cabin slot in shared-camera fallback mirrors the driver slot's frame.
         """
         src = self._sources.get(slot)
         if src is None:
             return None
+        if getattr(src, "shared_with", None):
+            donor = self._sources.get(src.shared_with)
+            if donor is None:
+                return None
+            with donor.frame_lock:
+                return donor.frame
         with src.frame_lock:
             return src.frame
 
@@ -717,7 +1127,19 @@ class CameraManager:
             device_num = None
 
             # Prefer the camera's own source; fall back to the legacy cap view.
-            if src is not None and src.cap is not None and src.cap.isOpened():
+            # A shared-fallback slot mirrors its donor's device/frames honestly.
+            shared_with = getattr(src, "shared_with", None) if src is not None else None
+            if shared_with:
+                donor = self._sources.get(shared_with)
+                if donor is not None and donor.cap is not None and donor.cap.isOpened():
+                    connected = True
+                    device_num = donor.device_num()
+                    resolution, fps, fps_source = self._cap_metadata(donor.cap, donor.measured_fps)
+                elif is_active and self._cap is not None and self._cap.isOpened():
+                    connected = True
+                    device_num = 0
+                    resolution, fps, fps_source = self._read_cap_metadata()
+            elif src is not None and src.cap is not None and src.cap.isOpened():
                 connected = True
                 device_num = src.device_num()
                 resolution, fps, fps_source = self._cap_metadata(src.cap, src.measured_fps)
@@ -731,6 +1153,12 @@ class CameraManager:
                 last_frame = datetime.fromtimestamp(
                     src.last_frame_time, timezone.utc
                 ).isoformat(timespec="seconds")
+            elif shared_with:
+                donor = self._sources.get(shared_with)
+                if donor is not None and donor.last_frame_time:
+                    last_frame = datetime.fromtimestamp(
+                        donor.last_frame_time, timezone.utc
+                    ).isoformat(timespec="seconds")
 
             camera_index = device_num if device_num is not None else (0 if is_active else None)
 
@@ -750,6 +1178,8 @@ class CameraManager:
                 "active": is_active,
                 "last_frame_time": last_frame,
                 "error": (src.error if src is not None else None),
+                "shared": bool(shared_with),
+                "shared_with": shared_with,
             }
 
             if connected and device_num is not None:

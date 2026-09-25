@@ -10,6 +10,9 @@ build/
 # Environments
 venv/
 .venv/
+.env
+.env.local
+.env.*.local
 
 # Logs & session data
 bus_node/logs/
@@ -26,8 +29,20 @@ bus_node/src/yolov8n.pt
 *.db-shm
 *.db-wal
 
-# Graphify local-only files
-cost.json
+# Graphify knowledge graph — local tooling output only, never uploaded.
+# The graph still works locally; it is simply not part of the repository.
+graphify-out/
+.graphifyignore
+
+# Rendered video / brag output (regenerable media)
+brag-output-*/
+generated_audio/
+
+# Large local-only documents and raw datasets (kept on disk, never pushed).
+# The app loads control_centre/backend/data/mtc-gtfs.zip, not these copies.
+patent/
+SIH PPTX/
+data/Chennai_MTC_QGIS_Project/
 
 # OS
 .DS_Store

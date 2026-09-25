@@ -75,10 +75,11 @@ def _make_event(**overrides):
 # ---------------------------------------------------------------------------
 
 def test_risk_level_calculation():
-    """Test that risk levels are calculated correctly."""
+    """Test that risk levels are calculated correctly (HIGH starts at 60)."""
     assert level_for_score(10) == "LOW"
     assert level_for_score(30) == "MODERATE"
-    assert level_for_score(55) == "HIGH"
+    assert level_for_score(59) == "MODERATE"
+    assert level_for_score(60) == "HIGH"
     assert level_for_score(80) == "CRITICAL"
     assert level_for_score(0) == "LOW"
     assert level_for_score(100) == "CRITICAL"

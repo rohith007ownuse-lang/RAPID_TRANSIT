@@ -113,44 +113,44 @@ class TestEventCoalescer:
         assert received[0]["type"] == "incident_created"
 
     def test_coalesced_event_queued(self):
-        coalescer = EventCoalescer(window_s=0.1)
+        coalescer = EventCoalescer(window_s=0.05)
         received = []
         event = {"type": "health_update", "bus_id": "BUS-001", "score": 85}
         coalescer.process(event, lambda e: received.append(e))
         # Should not be immediately available
         assert len(received) == 0
         # Wait for flush
-        time.sleep(0.15)
+        time.sleep(0.1)
         assert len(received) == 1
 
     def test_multiple_coalesced_events(self):
-        coalescer = EventCoalescer(window_s=0.1)
+        coalescer = EventCoalescer(window_s=0.05)
         received = []
         for i in range(5):
             event = {"type": "eta_update", "bus_id": "BUS-001", "eta": 10 + i}
             coalescer.process(event, lambda e: received.append(e))
-        time.sleep(0.15)
+        time.sleep(0.1)
         # Should coalesce to 1 (latest)
         assert len(received) == 1
         assert received[0]["eta"] == 14  # Latest value
 
     def test_clear(self):
-        coalescer = EventCoalescer(window_s=0.1)
+        coalescer = EventCoalescer(window_s=0.05)
         received = []
         event = {"type": "load_update", "bus_id": "BUS-001", "load": 50}
         coalescer.process(event, lambda e: received.append(e))
         coalescer.clear()
-        time.sleep(0.15)
+        time.sleep(0.1)
         assert len(received) == 0
 
     def test_different_bus_ids_not_coalesced(self):
-        coalescer = EventCoalescer(window_s=0.1)
+        coalescer = EventCoalescer(window_s=0.05)
         received = []
         event1 = {"type": "health_update", "bus_id": "BUS-001", "score": 85}
         event2 = {"type": "health_update", "bus_id": "BUS-002", "score": 90}
         coalescer.process(event1, lambda e: received.append(e))
         coalescer.process(event2, lambda e: received.append(e))
-        time.sleep(0.15)
+        time.sleep(0.1)
         # Different bus IDs should not coalesce
         assert len(received) == 2
 

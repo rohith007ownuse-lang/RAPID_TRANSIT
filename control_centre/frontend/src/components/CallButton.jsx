@@ -13,7 +13,7 @@ export default function CallButton({ busId, label }) {
   if (isThis && call.status !== 'idle') {
     return (
       <button className="btn call-connected" onClick={hangup} title={`On call with ${busId} — tap to end`}>
-        <span className="cc-pulse" /> ☎ {call.direction === 'in' ? 'Driver called you' : 'On call'} · {busId} · End
+        <span className="cc-pulse" /> ☎ {call.direction === 'in' ? 'Driver called you' : 'On call'} · End
       </button>
     )
   }
@@ -25,7 +25,7 @@ export default function CallButton({ busId, label }) {
       onClick={() => outboundCall(busId, label || busId)}
       title={busyElsewhere ? `Already on a call with ${call.busId}` : `Call ${busId} — driver answers directly`}
     >
-      📞 Call {busId}
+      📞 Call
     </button>
   )
 }

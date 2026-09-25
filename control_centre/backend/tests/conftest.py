@@ -25,5 +25,11 @@ def _isolate_db(tmp_path):
     # Development test admin (admin / admin123); injected outside any env so
     # tests are deterministic regardless of host environment variables.
     admin = auth.create_user("admin", "admin123", auth.ROLE_ADMIN)
+    # The event store now correlates events into incidents (Phase 16 wiring
+    # in DataStore.add_event), so every test must also start with an empty
+    # incident store or incident counts leak between tests.
+    from incident_intelligence import incident_store
+    incident_store.clear()
     yield admin
     persistence.truncate()
+    incident_store.clear()

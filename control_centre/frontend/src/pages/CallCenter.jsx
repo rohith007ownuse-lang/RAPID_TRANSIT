@@ -117,7 +117,7 @@ export default function CallCenter() {
             <div>
               <strong>No active call</strong>
               <div className="muted" style={{ fontSize: 13, marginTop: 2 }}>
-                Dial a bus on the left, or simulate the <em>driver pressing the in-bus CALL button</em> below
+                Dial a bus on the left, or trigger the <em>driver pressing the in-bus CALL button</em> below
                 (when real hardware is installed, that button rings this room directly).
               </div>
             </div>
@@ -129,7 +129,7 @@ export default function CallCenter() {
               }}
               disabled={!buses.length}
             >
-              📲 Simulate: driver calls the operator
+              📲 Demo: driver calls the operator
             </button>
           </div>
         ) : (
@@ -212,7 +212,7 @@ export default function CallCenter() {
                     <button
                       className="btn call-ring"
                       disabled={busyOther}
-                      title="Simulate the driver pressing the in-bus CALL button — rings the control room"
+                      title="Demo: driver pressing the in-bus CALL button — rings the control room"
                       onClick={() => simulateIncoming(b.bus_id, label(b))}
                     >
                       📲 Driver calls you

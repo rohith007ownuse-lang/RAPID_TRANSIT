@@ -4,7 +4,7 @@ Running phase-by-phase record of the **AI Urban Intelligence Platform** project.
 Purpose: keep a durable summary of decisions, structure, and verification results
 so work can resume cleanly even after a fresh session.
 
-Project root: `/home/rohith/AI_Urban_Intelligence_Platform/`
+Project root: `/home/rohith/Desktop/Rapid-Tracker/`
 Master plan: `PLAN.md` (architecture, flow diagrams, phases, event model, config).
 Original DDS baseline (UNTOUCHED): `/home/rohith/Documents/D.D.S/DriverDrowsinessDetectionSystem/`
 

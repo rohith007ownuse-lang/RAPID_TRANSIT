@@ -1,6 +1,6 @@
-# Urban Intelligence Control Centre
+# Rapid Transit Control Centre
 
-**What it is.** A full-stack, AI-flavoured **city public-transport operations & analytics platform** (SIH / "AI Urban Intelligence Platform"). It visualises a live bus fleet on a street map, streams driver/vehicle/road alerts into an operations dashboard, lets an operator review, acknowledge and resolve incidents, makes **live phone-style calls to drivers** directly from the dashboard, and produces boarding / fare / pothole analytics. Everything is currently a **realistic simulator** (labelled SIMULATION), with a WebSocket gateway ready to ingest **real bus-node hardware** later.
+**What it is.** A full-stack, AI-flavoured **city public-transport operations & analytics platform** (SIH / "Rapid Transit"). It visualises a live bus fleet on a street map, streams driver/vehicle/road alerts into an operations dashboard, lets an operator review, acknowledge and resolve incidents, makes **live phone-style calls to drivers** directly from the dashboard, and produces boarding / fare / pothole analytics. Everything is currently a **realistic simulator** (labelled SIMULATION), with a WebSocket gateway ready to ingest **real bus-node hardware** later.
 
 ---
 

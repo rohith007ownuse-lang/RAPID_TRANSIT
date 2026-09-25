@@ -22,8 +22,37 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 // Configuration
 // ---------------------------------------------------------------------------
 
-const WS_BASE = `ws://${typeof window !== 'undefined' ? window.location.hostname : '127.0.0.1'}`
 const WS_PORT = 8765
+
+// Build a WebSocket URL that survives an HTTPS deployment.
+//
+// - VITE_WS_URL (set at build time) pins the API host explicitly, for the
+//   common split where the frontend is served by one host and the API by
+//   another. It may be absolute ("https://api.example.com") or a
+//   same-origin path ("/"); https/http are upgraded to wss/ws so the browser
+//   never blocks the socket as mixed content.
+// - Without it, the socket is derived from the page origin, so serving the
+//   SPA and the API behind one host (or an nginx proxy) needs no config.
+export function wsUrl(path = '/', port) {
+  const configured = (import.meta.env && import.meta.env.VITE_WS_URL) || ''
+  const origin = typeof window !== 'undefined' ? window.location.origin : 'http://127.0.0.1'
+
+  let url
+  if (configured) {
+    url = new URL(configured, origin)
+  } else {
+    const secure = typeof window !== 'undefined' && window.location.protocol === 'https:'
+    url = new URL(`${secure ? 'wss' : 'ws'}://${typeof window !== 'undefined' ? window.location.host : '127.0.0.1'}${path}`)
+    if (port) url.port = String(port)
+    return url.toString()
+  }
+
+  url.protocol = url.protocol === 'https:' ? 'wss:' : url.protocol === 'http:' ? 'ws:' : url.protocol
+  if (port) url.port = String(port)
+  const base = url.pathname.replace(/\/+$/, '')
+  url.pathname = `${base}${path.startsWith('/') ? path : `/${path}`}`
+  return url.toString()
+}
 
 const RECONNECT_BASE_DELAY = 1000  // 1 second
 const RECONNECT_MAX_DELAY = 30000  // 30 seconds
@@ -123,7 +152,7 @@ class FleetWebSocketClient {
     this._token = token
     this._setState(ConnectionState.CONNECTING)
 
-    const url = `${WS_BASE}:${WS_PORT}`
+    const url = wsUrl('/', WS_PORT)
     try {
       this._ws = new WebSocket(url)
     } catch (err) {

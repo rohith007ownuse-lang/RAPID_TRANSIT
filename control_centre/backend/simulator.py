@@ -23,25 +23,45 @@ Realistic demo model:
 Real bus data will replace this in a later phase (bus_node -> WebSocket).
 """
 
+import logging
 import random
 import threading
 import time
 from collections import deque
 from math import hypot
+from pathlib import Path
 
 from data_store import store, mode_state, utcnow_iso
 from predictive_health import tick_all, DataSource, generate_health_events
 
+# GTFS Shape Interpolator (optional enhancement)
+try:
+    from gtfs_shape_interpolator import route_shape_manager
+    _HAS_SHAPE_INTERPOLATOR = True
+except ImportError:
+    _HAS_SHAPE_INTERPOLATOR = False
+
+log = logging.getLogger(__name__)
+
 SIMULATION = True
 
 # ---------------------------------------------------------------------------
-# Routes with realistic Chennai/North-India MTC stop sequences.
-# Each stop: {"stop": name, "lat": .., "lon": .., "major": bool}
-# Major stops (terminals / junctions) board more passengers than minor stops.
-# 70V runs the classic Koyambedu (CMBT) -> Kilambakkam (KCBT) corridor (~20 stops).
+# Route data source: GTFS (preferred) or hardcoded fallback.
+#
+# GTFS data from: https://github.com/ungalsoththu/ChennaiGTFS (ODbL)
+# Contains 4611 MTC bus routes, 5477 stops, 47047 trips.
+# We select a curated subset for the demo fleet.
 # ---------------------------------------------------------------------------
-ROUTES = [
-    {
+_GTFS_PATH = str(Path(__file__).parent / "data" / "mtc-gtfs.zip")
+ROUTES = None  # Will be set to GTFS routes or fallback (loaded lazily)
+mtc_provider = None  # Set when GTFS loads
+
+# ---------------------------------------------------------------------------
+# Fallback routes (used only if GTFS fails to load).
+# Defined here but assigned lazily in _ensure_gtfs_loaded().
+# ---------------------------------------------------------------------------
+_FALLBACK_ROUTES = [
+        {
         "code": "1A", "name": "1A - Thiruvottiyur to Broadway",
         "stops": [
             {"stop": "Thiruvottiyur", "lat": 13.1600, "lon": 80.2980, "major": True},
@@ -284,25 +304,936 @@ ROUTES = [
         ],
         "ev": False,
     },
+
+    # -----------------------------------------------------------------------
+    # Additional MTC routes (realistic Chennai route numbers + stops)
+    # -----------------------------------------------------------------------
+    {"code": "55E", "name": "55E - Adyar to T.Nagar",
+     "stops": [
+         {"stop": "Adyar Bus Depot", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Sardar Patel Road", "lat": 13.0100, "lon": 80.2500, "major": False},
+         {"stop": "R.A. Puram", "lat": 13.0150, "lon": 80.2530, "major": False},
+         {"stop": "Mandaveli", "lat": 13.0200, "lon": 80.2600, "major": False},
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+     ], "ev": False},
+    {"code": "55H", "name": "55H - T.Nagar to Tambaram",
+     "stops": [
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Kodambakkam", "lat": 13.0400, "lon": 80.2280, "major": False},
+         {"stop": "Vadapalani", "lat": 13.0510, "lon": 80.2150, "major": False},
+         {"stop": "Virugambakkam", "lat": 13.0550, "lon": 80.2100, "major": False},
+         {"stop": "Alwarthirunagar", "lat": 13.0700, "lon": 80.2050, "major": False},
+         {"stop": "Valasaravakkam", "lat": 13.0480, "lon": 80.2050, "major": False},
+         {"stop": "Arumbakkam", "lat": 13.0680, "lon": 80.1930, "major": False},
+         {"stop": "CMBT", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Avadi", "lat": 13.1060, "lon": 80.0970, "major": True},
+         {"stop": "Tambaram", "lat": 12.9250, "lon": 80.1270, "major": True},
+     ], "ev": False},
+    {"code": "55C", "name": "55C - T.Nagar to Chromepet",
+     "stops": [
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Saidapet", "lat": 13.0200, "lon": 80.2230, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Meenambakkam", "lat": 12.9941, "lon": 80.1707, "major": False},
+         {"stop": "Tirusulam", "lat": 12.9890, "lon": 80.1670, "major": False},
+         {"stop": "Pallavaram", "lat": 12.9680, "lon": 80.1600, "major": True},
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+     ], "ev": False},
+    {"code": "55X", "name": "55X - Adyar to Tambaram Express",
+     "stops": [
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Pallavaram", "lat": 12.9680, "lon": 80.1600, "major": True},
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+         {"stop": "Tambaram", "lat": 12.9250, "lon": 80.1270, "major": True},
+     ], "ev": False},
+    {"code": "21B", "name": "21B - Broadway to Mylapore",
+     "stops": [
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+         {"stop": "Parry's Corner", "lat": 13.0890, "lon": 80.2860, "major": False},
+         {"stop": "High Court", "lat": 13.0870, "lon": 80.2830, "major": False},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Nungambakkam", "lat": 13.0610, "lon": 80.2500, "major": False},
+         {"stop": "Kodambakkam", "lat": 13.0400, "lon": 80.2280, "major": False},
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+     ], "ev": False},
+    {"code": "23G", "name": "23G - T.Nagar to Guindy",
+     "stops": [
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Ashok Pillar", "lat": 13.0380, "lon": 80.2070, "major": False},
+         {"stop": "Kodambakkam", "lat": 13.0400, "lon": 80.2280, "major": False},
+         {"stop": "Saidapet", "lat": 13.0200, "lon": 80.2230, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+     ], "ev": False},
+    {"code": "27C", "name": "27C - Anna Nagar to Broadway",
+     "stops": [
+         {"stop": "Anna Nagar West", "lat": 13.0850, "lon": 80.2100, "major": True},
+         {"stop": "Anna Nagar Tower", "lat": 13.0860, "lon": 80.2150, "major": False},
+         {"stop": "Thirumangalam", "lat": 13.0950, "lon": 80.2200, "major": False},
+         {"stop": "Kilpauk", "lat": 13.0750, "lon": 80.2400, "major": False},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Central Station", "lat": 13.0790, "lon": 80.2780, "major": True},
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+     ], "ev": False},
+    {"code": "30D", "name": "30D - T.Nagar to Broadway via Pondy Bazaar",
+     "stops": [
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Pondy Bazaar", "lat": 13.0330, "lon": 80.2340, "major": True},
+         {"stop": "Lloyds Road", "lat": 13.0360, "lon": 80.2370, "major": False},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Central Station", "lat": 13.0790, "lon": 80.2780, "major": True},
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+     ], "ev": False},
+    {"code": "36B", "name": "36B - Adyar to Broadway",
+     "stops": [
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Saidapet", "lat": 13.0200, "lon": 80.2230, "major": True},
+         {"stop": "Teynampet", "lat": 13.0280, "lon": 80.2500, "major": False},
+         {"stop": "Anna Salai", "lat": 13.0550, "lon": 80.2600, "major": False},
+         {"stop": "LIC", "lat": 13.0660, "lon": 80.2700, "major": False},
+         {"stop": "Fort", "lat": 13.0780, "lon": 80.2740, "major": False},
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+     ], "ev": False},
+    {"code": "40E", "name": "40E - Velachery to Tambaram",
+     "stops": [
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+         {"stop": "Velachery Bypass", "lat": 12.9750, "lon": 80.2100, "major": False},
+         {"stop": "Maduranthakam", "lat": 12.9600, "lon": 80.1900, "major": False},
+         {"stop": "Tambaram Sanatorium", "lat": 12.9350, "lon": 80.1400, "major": False},
+         {"stop": "Tambaram", "lat": 12.9250, "lon": 80.1270, "major": True},
+     ], "ev": False},
+    {"code": "45A", "name": "45A - Koyambedu to Adyar",
+     "stops": [
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Vadapalani", "lat": 13.0510, "lon": 80.2150, "major": False},
+         {"stop": "Ashok Pillar", "lat": 13.0380, "lon": 80.2070, "major": False},
+         {"stop": "Saidapet", "lat": 13.0200, "lon": 80.2230, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+     ], "ev": False},
+    {"code": "47B", "name": "47B - Avadi to Broadway",
+     "stops": [
+         {"stop": "Avadi", "lat": 13.1060, "lon": 80.0970, "major": True},
+         {"stop": "Ambattur", "lat": 13.1140, "lon": 80.1550, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Vadapalani", "lat": 13.0510, "lon": 80.2150, "major": False},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+     ], "ev": False},
+    {"code": "51C", "name": "51C - Guindy to Velachery",
+     "stops": [
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Guindy National Park", "lat": 13.0040, "lon": 80.2250, "major": False},
+         {"stop": "Nanganallur", "lat": 12.9900, "lon": 80.2050, "major": False},
+         {"stop": "Meenambakkam", "lat": 12.9941, "lon": 80.1707, "major": False},
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+     ], "ev": False},
+    {"code": "54B", "name": "54B - T.Nagar to Koyambedu via Ashok Pillar",
+     "stops": [
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Ashok Pillar", "lat": 13.0380, "lon": 80.2070, "major": False},
+         {"stop": "Valasaravakkam", "lat": 13.0480, "lon": 80.2050, "major": False},
+         {"stop": "Arumbakkam", "lat": 13.0680, "lon": 80.1930, "major": False},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+     ], "ev": False},
+    {"code": "60A", "name": "60A - Adyar to Sholinganallur",
+     "stops": [
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Thiruvanmiyur", "lat": 12.9830, "lon": 80.2650, "major": False},
+         {"stop": "Marina Beach Road", "lat": 12.9750, "lon": 80.2600, "major": False},
+         {"stop": "Injambakkam", "lat": 12.9600, "lon": 80.2500, "major": False},
+         {"stop": "Sholinganallur", "lat": 12.9000, "lon": 80.2250, "major": True},
+     ], "ev": False},
+    {"code": "63B", "name": "63B - Broadway to Velachery",
+     "stops": [
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+         {"stop": "Central Station", "lat": 13.0790, "lon": 80.2780, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Nungambakkam", "lat": 13.0610, "lon": 80.2500, "major": False},
+         {"stop": "Teynampet", "lat": 13.0280, "lon": 80.2500, "major": False},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+     ], "ev": False},
+    {"code": "66E", "name": "66E - Mylapore to Tambaram",
+     "stops": [
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Pallavaram", "lat": 12.9680, "lon": 80.1600, "major": True},
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+         {"stop": "Tambaram", "lat": 12.9250, "lon": 80.1270, "major": True},
+     ], "ev": False},
+    {"code": "70D", "name": "70D - CMBT to Perambur",
+     "stops": [
+         {"stop": "CMBT", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Mogappair", "lat": 13.0820, "lon": 80.1750, "major": False},
+         {"stop": "Ambattur", "lat": 13.1140, "lon": 80.1550, "major": True},
+         {"stop": "Perambur", "lat": 13.1090, "lon": 80.2370, "major": True},
+     ], "ev": False},
+    {"code": "79E", "name": "79E - Broadway to Adyar via R.A.Puram",
+     "stops": [
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+         {"stop": "Fort", "lat": 13.0780, "lon": 80.2740, "major": False},
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+         {"stop": "R.A. Puram", "lat": 13.0150, "lon": 80.2530, "major": False},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+     ], "ev": False},
+    {"code": "82C", "name": "82C - Anna Nagar to T.Nagar",
+     "stops": [
+         {"stop": "Anna Nagar West", "lat": 13.0850, "lon": 80.2100, "major": True},
+         {"stop": "Thirumangalam", "lat": 13.0950, "lon": 80.2200, "major": False},
+         {"stop": "Kilpauk", "lat": 13.0750, "lon": 80.2400, "major": False},
+         {"stop": "Nungambakkam", "lat": 13.0610, "lon": 80.2500, "major": False},
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+     ], "ev": False},
+    {"code": "88B", "name": "88B - Koyambedu to T.Nagar Express",
+     "stops": [
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Vadapalani", "lat": 13.0510, "lon": 80.2150, "major": False},
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+     ], "ev": False},
+    {"code": "91A", "name": "91A - Adyar to Sholinganallur via Thiruvanmiyur",
+     "stops": [
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Thiruvanmiyur", "lat": 12.9830, "lon": 80.2650, "major": False},
+         {"stop": "Perungudi", "lat": 12.9650, "lon": 80.2400, "major": False},
+         {"stop": "Sholinganallur", "lat": 12.9000, "lon": 80.2250, "major": True},
+     ], "ev": False},
+    {"code": "95A", "name": "95A - Koyambedu to Velachery",
+     "stops": [
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Vadapalani", "lat": 13.0510, "lon": 80.2150, "major": False},
+         {"stop": "Ashok Pillar", "lat": 13.0380, "lon": 80.2070, "major": False},
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+     ], "ev": False},
+    {"code": "99E", "name": "99E - Broadway to Tambaram via Guindy",
+     "stops": [
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Saidapet", "lat": 13.0200, "lon": 80.2230, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Pallavaram", "lat": 12.9680, "lon": 80.1600, "major": True},
+         {"stop": "Tambaram", "lat": 12.9250, "lon": 80.1270, "major": True},
+     ], "ev": False},
+    {"code": "101A", "name": "101A - Adyar to Koyambedu",
+     "stops": [
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Saidapet", "lat": 13.0200, "lon": 80.2230, "major": True},
+         {"stop": "Vadapalani", "lat": 13.0510, "lon": 80.2150, "major": False},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+     ], "ev": False},
+    {"code": "104B", "name": "104B - Velachery to Broadway",
+     "stops": [
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+         {"stop": "Fort", "lat": 13.0780, "lon": 80.2740, "major": False},
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+     ], "ev": False},
+    {"code": "106E", "name": "106E - T.Nagar to Sholinganallur",
+     "stops": [
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Thiruvanmiyur", "lat": 12.9830, "lon": 80.2650, "major": False},
+         {"stop": "Perungudi", "lat": 12.9650, "lon": 80.2400, "major": False},
+         {"stop": "Sholinganallur", "lat": 12.9000, "lon": 80.2250, "major": True},
+     ], "ev": False},
+    {"code": "109A", "name": "109A - Koyambedu to Adyar Express",
+     "stops": [
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Saidapet", "lat": 13.0200, "lon": 80.2230, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+     ], "ev": False},
+    {"code": "112B", "name": "112B - Broadway to Velachery via Mylapore",
+     "stops": [
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+     ], "ev": False},
+    {"code": "115E", "name": "115E - Avadi to T.Nagar",
+     "stops": [
+         {"stop": "Avadi", "lat": 13.1060, "lon": 80.0970, "major": True},
+         {"stop": "Ambattur", "lat": 13.1140, "lon": 80.1550, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Vadapalani", "lat": 13.0510, "lon": 80.2150, "major": False},
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+     ], "ev": False},
+    {"code": "118C", "name": "118C - Guindy to Koyambedu",
+     "stops": [
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Ashok Pillar", "lat": 13.0380, "lon": 80.2070, "major": False},
+         {"stop": "Valasaravakkam", "lat": 13.0480, "lon": 80.2050, "major": False},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+     ], "ev": False},
+    {"code": "121B", "name": "121B - Adyar to Ambattur",
+     "stops": [
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Saidapet", "lat": 13.0200, "lon": 80.2230, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Ambattur", "lat": 13.1140, "lon": 80.1550, "major": True},
+     ], "ev": False},
+    {"code": "123D", "name": "123D - Broadway to Chromepet",
+     "stops": [
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Pallavaram", "lat": 12.9680, "lon": 80.1600, "major": True},
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+     ], "ev": False},
+    {"code": "127A", "name": "127A - T.Nagar to Sholinganallur via Velachery",
+     "stops": [
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+         {"stop": "Perungudi", "lat": 12.9650, "lon": 80.2400, "major": False},
+         {"stop": "Sholinganallur", "lat": 12.9000, "lon": 80.2250, "major": True},
+     ], "ev": False},
+    {"code": "130B", "name": "130B - Koyambedu to Broadway via Egmore",
+     "stops": [
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Central Station", "lat": 13.0790, "lon": 80.2780, "major": True},
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+     ], "ev": False},
+    {"code": "135E", "name": "135E - Avadi to Velachery",
+     "stops": [
+         {"stop": "Avadi", "lat": 13.1060, "lon": 80.0970, "major": True},
+         {"stop": "Ambattur", "lat": 13.1140, "lon": 80.1550, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+     ], "ev": False},
+    {"code": "138C", "name": "138C - Broadway to Guindy",
+     "stops": [
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Saidapet", "lat": 13.0200, "lon": 80.2230, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+     ], "ev": False},
+    {"code": "141A", "name": "141A - Adyar to CMBT",
+     "stops": [
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Saidapet", "lat": 13.0200, "lon": 80.2230, "major": True},
+         {"stop": "Vadapalani", "lat": 13.0510, "lon": 80.2150, "major": False},
+         {"stop": "CMBT", "lat": 13.0694, "lon": 80.1948, "major": True},
+     ], "ev": False},
+    {"code": "144B", "name": "144B - Koyambedu to Mylapore",
+     "stops": [
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Vadapalani", "lat": 13.0510, "lon": 80.2150, "major": False},
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+     ], "ev": False},
+    {"code": "147D", "name": "147D - Tambaram to Broadway via Guindy",
+     "stops": [
+         {"stop": "Tambaram", "lat": 12.9250, "lon": 80.1270, "major": True},
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+         {"stop": "Pallavaram", "lat": 12.9680, "lon": 80.1600, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Saidapet", "lat": 13.0200, "lon": 80.2230, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+     ], "ev": False},
+    {"code": "150A", "name": "150A - Velachery to Avadi",
+     "stops": [
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Ambattur", "lat": 13.1140, "lon": 80.1550, "major": True},
+         {"stop": "Avadi", "lat": 13.1060, "lon": 80.0970, "major": True},
+     ], "ev": False},
+    {"code": "153B", "name": "153B - Broadway to Adyar Express",
+     "stops": [
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+     ], "ev": False},
+    {"code": "156C", "name": "156C - T.Nagar to Tambaram via Adyar",
+     "stops": [
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+         {"stop": "Tambaram", "lat": 12.9250, "lon": 80.1270, "major": True},
+     ], "ev": False},
+    {"code": "159E", "name": "159E - Koyambedu to Sholinganallur",
+     "stops": [
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Vadapalani", "lat": 13.0510, "lon": 80.2150, "major": False},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Thiruvanmiyur", "lat": 12.9830, "lon": 80.2650, "major": False},
+         {"stop": "Sholinganallur", "lat": 12.9000, "lon": 80.2250, "major": True},
+     ], "ev": False},
+    {"code": "162A", "name": "162A - Broadway to Velachery via T.Nagar",
+     "stops": [
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+     ], "ev": False},
+    {"code": "165B", "name": "165B - Adyar to Avadi",
+     "stops": [
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Ambattur", "lat": 13.1140, "lon": 80.1550, "major": True},
+         {"stop": "Avadi", "lat": 13.1060, "lon": 80.0970, "major": True},
+     ], "ev": False},
+    {"code": "168C", "name": "168C - Guindy to Broadway",
+     "stops": [
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Saidapet", "lat": 13.0200, "lon": 80.2230, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+     ], "ev": False},
+    {"code": "171A", "name": "171A - T.Nagar to Chromepet",
+     "stops": [
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Saidapet", "lat": 13.0200, "lon": 80.2230, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+     ], "ev": False},
+    {"code": "174B", "name": "174B - Broadway to Sholinganallur",
+     "stops": [
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+         {"stop": "Thiruvanmiyur", "lat": 12.9830, "lon": 80.2650, "major": False},
+         {"stop": "Sholinganallur", "lat": 12.9000, "lon": 80.2250, "major": True},
+     ], "ev": False},
+    {"code": "177C", "name": "177C - Koyambedu to Mylapore via T.Nagar",
+     "stops": [
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+     ], "ev": False},
+    {"code": "180A", "name": "180A - Velachery to Adyar",
+     "stops": [
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+     ], "ev": False},
+    {"code": "183B", "name": "183B - Tambaram to T.Nagar",
+     "stops": [
+         {"stop": "Tambaram", "lat": 12.9250, "lon": 80.1270, "major": True},
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Saidapet", "lat": 13.0200, "lon": 80.2230, "major": True},
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+     ], "ev": False},
+    {"code": "186E", "name": "186E - Adyar to CMBT via Guindy",
+     "stops": [
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Vadapalani", "lat": 13.0510, "lon": 80.2150, "major": False},
+         {"stop": "CMBT", "lat": 13.0694, "lon": 80.1948, "major": True},
+     ], "ev": False},
+    {"code": "189A", "name": "189A - Broadway to Velachery via Egmore",
+     "stops": [
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+     ], "ev": False},
+    {"code": "192B", "name": "192B - Koyambedu to Broadway",
+     "stops": [
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+     ], "ev": False},
+    {"code": "195C", "name": "195C - Avadi to Adyar",
+     "stops": [
+         {"stop": "Avadi", "lat": 13.1060, "lon": 80.0970, "major": True},
+         {"stop": "Ambattur", "lat": 13.1140, "lon": 80.1550, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+     ], "ev": False},
+    {"code": "198E", "name": "198E - T.Nagar to Broadway Express",
+     "stops": [
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+     ], "ev": False},
+    {"code": "201A", "name": "201A - Chromepet to Broadway",
+     "stops": [
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+         {"stop": "Pallavaram", "lat": 12.9680, "lon": 80.1600, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+     ], "ev": False},
+    {"code": "204B", "name": "204B - Sholinganallur to T.Nagar",
+     "stops": [
+         {"stop": "Sholinganallur", "lat": 12.9000, "lon": 80.2250, "major": True},
+         {"stop": "Perungudi", "lat": 12.9650, "lon": 80.2400, "major": False},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+     ], "ev": False},
+    {"code": "207C", "name": "207C - Tambaram to Adyar",
+     "stops": [
+         {"stop": "Tambaram", "lat": 12.9250, "lon": 80.1270, "major": True},
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+     ], "ev": False},
+    {"code": "210A", "name": "210A - Ambattur to Mylapore",
+     "stops": [
+         {"stop": "Ambattur", "lat": 13.1140, "lon": 80.1550, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+     ], "ev": False},
+    {"code": "213B", "name": "213B - Avadi to Velachery Express",
+     "stops": [
+         {"stop": "Avadi", "lat": 13.1060, "lon": 80.0970, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+     ], "ev": False},
+    {"code": "216E", "name": "216E - Broadway to Chromepet via Egmore",
+     "stops": [
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+     ], "ev": False},
+    {"code": "219A", "name": "219A - T.Nagar to Avadi",
+     "stops": [
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Ambattur", "lat": 13.1140, "lon": 80.1550, "major": True},
+         {"stop": "Avadi", "lat": 13.1060, "lon": 80.0970, "major": True},
+     ], "ev": False},
+    {"code": "222B", "name": "222B - Adyar to Tambaram via Guindy",
+     "stops": [
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Pallavaram", "lat": 12.9680, "lon": 80.1600, "major": True},
+         {"stop": "Tambaram", "lat": 12.9250, "lon": 80.1270, "major": True},
+     ], "ev": False},
+    {"code": "225C", "name": "225C - Sholinganallur to Broadway",
+     "stops": [
+         {"stop": "Sholinganallur", "lat": 12.9000, "lon": 80.2250, "major": True},
+         {"stop": "Thiruvanmiyur", "lat": 12.9830, "lon": 80.2650, "major": False},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+     ], "ev": False},
+    {"code": "228E", "name": "228E - Koyambedu to Adyar Express",
+     "stops": [
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+     ], "ev": False},
+    {"code": "231A", "name": "231A - Guindy to Velachery via Sholinganallur",
+     "stops": [
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+         {"stop": "Perungudi", "lat": 12.9650, "lon": 80.2400, "major": False},
+         {"stop": "Sholinganallur", "lat": 12.9000, "lon": 80.2250, "major": True},
+     ], "ev": False},
+    {"code": "234B", "name": "234B - Broadway to Velachery Express",
+     "stops": [
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+     ], "ev": False},
+    {"code": "237C", "name": "237C - Tambaram to Koyambedu",
+     "stops": [
+         {"stop": "Tambaram", "lat": 12.9250, "lon": 80.1270, "major": True},
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+         {"stop": "Pallavaram", "lat": 12.9680, "lon": 80.1600, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+     ], "ev": False},
+    {"code": "240A", "name": "240A - Mylapore to Avadi",
+     "stops": [
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Ambattur", "lat": 13.1140, "lon": 80.1550, "major": True},
+         {"stop": "Avadi", "lat": 13.1060, "lon": 80.0970, "major": True},
+     ], "ev": False},
+    {"code": "243B", "name": "243B - Adyar to Broadway via Mylapore",
+     "stops": [
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+         {"stop": "Fort", "lat": 13.0780, "lon": 80.2740, "major": False},
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+     ], "ev": False},
+    {"code": "246E", "name": "246E - Velachery to Broadway via Egmore",
+     "stops": [
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+     ], "ev": False},
+    {"code": "249A", "name": "249A - Chromepet to T.Nagar",
+     "stops": [
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+         {"stop": "Pallavaram", "lat": 12.9680, "lon": 80.1600, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+     ], "ev": False},
+    {"code": "252B", "name": "252B - Broadway to Sholinganallur via T.Nagar",
+     "stops": [
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Sholinganallur", "lat": 12.9000, "lon": 80.2250, "major": True},
+     ], "ev": False},
+    {"code": "255C", "name": "255C - Koyambedu to Chromepet",
+     "stops": [
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Vadapalani", "lat": 13.0510, "lon": 80.2150, "major": False},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+     ], "ev": False},
+    {"code": "258E", "name": "258E - Avadi to Mylapore",
+     "stops": [
+         {"stop": "Avadi", "lat": 13.1060, "lon": 80.0970, "major": True},
+         {"stop": "Ambattur", "lat": 13.1140, "lon": 80.1550, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+     ], "ev": False},
+    {"code": "261A", "name": "261A - Adyar to Koyambedu via T.Nagar",
+     "stops": [
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+     ], "ev": False},
+    {"code": "264B", "name": "264B - Broadway to Tambaram via Adyar",
+     "stops": [
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+         {"stop": "Tambaram", "lat": 12.9250, "lon": 80.1270, "major": True},
+     ], "ev": False},
+    {"code": "267C", "name": "267C - T.Nagar to Sholinganallur Express",
+     "stops": [
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Sholinganallur", "lat": 12.9000, "lon": 80.2250, "major": True},
+     ], "ev": False},
+    {"code": "270A", "name": "270A - Velachery to Broadway via Mylapore",
+     "stops": [
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+     ], "ev": False},
+    {"code": "273B", "name": "273B - Guindy to Tambaram Express",
+     "stops": [
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Pallavaram", "lat": 12.9680, "lon": 80.1600, "major": True},
+         {"stop": "Tambaram", "lat": 12.9250, "lon": 80.1270, "major": True},
+     ], "ev": False},
+    {"code": "276E", "name": "276E - Broadway to Adyar via Egmore",
+     "stops": [
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Teynampet", "lat": 13.0280, "lon": 80.2500, "major": False},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+     ], "ev": False},
+    {"code": "279A", "name": "279A - Ambattur to T.Nagar Express",
+     "stops": [
+         {"stop": "Ambattur", "lat": 13.1140, "lon": 80.1550, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+     ], "ev": False},
+    {"code": "282B", "name": "282B - Chromepet to Broadway via Guindy",
+     "stops": [
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+     ], "ev": False},
+    {"code": "285C", "name": "285C - Sholinganallur to Koyambedu",
+     "stops": [
+         {"stop": "Sholinganallur", "lat": 12.9000, "lon": 80.2250, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+     ], "ev": False},
+    {"code": "288E", "name": "288E - T.Nagar to Tambaram Express",
+     "stops": [
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Tambaram", "lat": 12.9250, "lon": 80.1270, "major": True},
+     ], "ev": False},
+    {"code": "291A", "name": "291A - Adyar to Velachery via Perungudi",
+     "stops": [
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Thiruvanmiyur", "lat": 12.9830, "lon": 80.2650, "major": False},
+         {"stop": "Perungudi", "lat": 12.9650, "lon": 80.2400, "major": False},
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+     ], "ev": False},
+    {"code": "294B", "name": "294B - Broadway to Koyambedu Express",
+     "stops": [
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+     ], "ev": False},
+    {"code": "297C", "name": "297C - Avadi to Chromepet",
+     "stops": [
+         {"stop": "Avadi", "lat": 13.1060, "lon": 80.0970, "major": True},
+         {"stop": "Ambattur", "lat": 13.1140, "lon": 80.1550, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+     ], "ev": False},
+    {"code": "300A", "name": "300A - Tambaram to Broadway via Mylapore",
+     "stops": [
+         {"stop": "Tambaram", "lat": 12.9250, "lon": 80.1270, "major": True},
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+     ], "ev": False},
+    {"code": "303B", "name": "303B - Koyambedu to Sholinganallur via Adyar",
+     "stops": [
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Vadapalani", "lat": 13.0510, "lon": 80.2150, "major": False},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Thiruvanmiyur", "lat": 12.9830, "lon": 80.2650, "major": False},
+         {"stop": "Sholinganallur", "lat": 12.9000, "lon": 80.2250, "major": True},
+     ], "ev": False},
+    {"code": "306E", "name": "306E - Velachery to Tambaram",
+     "stops": [
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Pallavaram", "lat": 12.9680, "lon": 80.1600, "major": True},
+         {"stop": "Tambaram", "lat": 12.9250, "lon": 80.1270, "major": True},
+     ], "ev": False},
+    {"code": "309A", "name": "309A - Broadway to Velachery via Mylapore",
+     "stops": [
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+     ], "ev": False},
+    {"code": "312B", "name": "312B - T.Nagar to Chromepet via Guindy",
+     "stops": [
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Pallavaram", "lat": 12.9680, "lon": 80.1600, "major": True},
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+     ], "ev": False},
+    {"code": "315C", "name": "315C - Avadi to Adyar via Koyambedu",
+     "stops": [
+         {"stop": "Avadi", "lat": 13.1060, "lon": 80.0970, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Vadapalani", "lat": 13.0510, "lon": 80.2150, "major": False},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+     ], "ev": False},
+    {"code": "318E", "name": "318E - Guindy to Broadway via Egmore",
+     "stops": [
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Saidapet", "lat": 13.0200, "lon": 80.2230, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+     ], "ev": False},
+    {"code": "321A", "name": "321A - Mylapore to Koyambedu via T.Nagar",
+     "stops": [
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+     ], "ev": False},
+    {"code": "324B", "name": "324B - Broadway to Sholinganallur via Adyar",
+     "stops": [
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Sholinganallur", "lat": 12.9000, "lon": 80.2250, "major": True},
+     ], "ev": False},
+    {"code": "327C", "name": "327C - Tambaram to Velachery",
+     "stops": [
+         {"stop": "Tambaram", "lat": 12.9250, "lon": 80.1270, "major": True},
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+     ], "ev": False},
+    {"code": "330E", "name": "330E - Koyambedu to Adyar Express",
+     "stops": [
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+     ], "ev": False},
+    {"code": "333A", "name": "333A - Velachery to Avadi via Koyambedu",
+     "stops": [
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Ambattur", "lat": 13.1140, "lon": 80.1550, "major": True},
+         {"stop": "Avadi", "lat": 13.1060, "lon": 80.0970, "major": True},
+     ], "ev": False},
+    {"code": "336B", "name": "336B - Adyar to Tambaram via Chromepet",
+     "stops": [
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+         {"stop": "Tambaram", "lat": 12.9250, "lon": 80.1270, "major": True},
+     ], "ev": False},
+    {"code": "339C", "name": "339C - Broadway to Koyambedu via Egmore",
+     "stops": [
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+     ], "ev": False},
+    {"code": "342E", "name": "342E - Sholinganallur to T.Nagar via Adyar",
+     "stops": [
+         {"stop": "Sholinganallur", "lat": 12.9000, "lon": 80.2250, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+     ], "ev": False},
+    {"code": "345A", "name": "345A - Chromepet to Velachery",
+     "stops": [
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+         {"stop": "Pallavaram", "lat": 12.9680, "lon": 80.1600, "major": True},
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+     ], "ev": False},
+    {"code": "348B", "name": "348B - Ambattur to T.Nagar via Koyambedu",
+     "stops": [
+         {"stop": "Ambattur", "lat": 13.1140, "lon": 80.1550, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Vadapalani", "lat": 13.0510, "lon": 80.2150, "major": False},
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+     ], "ev": False},
+    {"code": "351C", "name": "351C - Guindy to Sholinganallur",
+     "stops": [
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+         {"stop": "Perungudi", "lat": 12.9650, "lon": 80.2400, "major": False},
+         {"stop": "Sholinganallur", "lat": 12.9000, "lon": 80.2250, "major": True},
+     ], "ev": False},
+    {"code": "354E", "name": "354E - T.Nagar to Broadway via Mylapore",
+     "stops": [
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+         {"stop": "Fort", "lat": 13.0780, "lon": 80.2740, "major": False},
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+     ], "ev": False},
+    {"code": "357A", "name": "357A - Avadi to Broadway via Ambattur",
+     "stops": [
+         {"stop": "Avadi", "lat": 13.1060, "lon": 80.0970, "major": True},
+         {"stop": "Ambattur", "lat": 13.1140, "lon": 80.1550, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+     ], "ev": False},
+    {"code": "360B", "name": "360B - Adyar to Koyambedu Express",
+     "stops": [
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+     ], "ev": False},
+    {"code": "363C", "name": "363C - Tambaram to Broadway via Guindy",
+     "stops": [
+         {"stop": "Tambaram", "lat": 12.9250, "lon": 80.1270, "major": True},
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+     ], "ev": False},
+    {"code": "366E", "name": "366E - Velachery to Adyar Express",
+     "stops": [
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+     ], "ev": False},
+    {"code": "369A", "name": "369A - Koyambedu to Sholinganallur via Adyar",
+     "stops": [
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Sholinganallur", "lat": 12.9000, "lon": 80.2250, "major": True},
+     ], "ev": False},
+    {"code": "372B", "name": "372B - Broadway to Velachery via Egmore",
+     "stops": [
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Teynampet", "lat": 13.0280, "lon": 80.2500, "major": False},
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+     ], "ev": False},
+    {"code": "375C", "name": "375C - Avadi to Chromepet via Guindy",
+     "stops": [
+         {"stop": "Avadi", "lat": 13.1060, "lon": 80.0970, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+     ], "ev": False},
+    {"code": "378E", "name": "378E - Sholinganallur to Broadway via Mylapore",
+     "stops": [
+         {"stop": "Sholinganallur", "lat": 12.9000, "lon": 80.2250, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+     ], "ev": False},
+    {"code": "381A", "name": "381A - T.Nagar to Tambaram via Adyar",
+     "stops": [
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+         {"stop": "Mylapore", "lat": 13.0300, "lon": 80.2670, "major": True},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+         {"stop": "Tambaram", "lat": 12.9250, "lon": 80.1270, "major": True},
+     ], "ev": False},
+    {"code": "384B", "name": "384B - Guindy to Avadi Express",
+     "stops": [
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+         {"stop": "Ambattur", "lat": 13.1140, "lon": 80.1550, "major": True},
+         {"stop": "Avadi", "lat": 13.1060, "lon": 80.0970, "major": True},
+     ], "ev": False},
+    {"code": "387C", "name": "387C - Adyar to Broadway via Egmore",
+     "stops": [
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+     ], "ev": False},
+    {"code": "390E", "name": "390E - Broadway to Koyambedu via Egmore",
+     "stops": [
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Koyambedu", "lat": 13.0694, "lon": 80.1948, "major": True},
+     ], "ev": False},
+    {"code": "393A", "name": "393A - Velachery to Tambaram Express",
+     "stops": [
+         {"stop": "Velachery", "lat": 12.9810, "lon": 80.2180, "major": True},
+         {"stop": "Tambaram", "lat": 12.9250, "lon": 80.1270, "major": True},
+     ], "ev": False},
+    {"code": "396B", "name": "396B - Sholinganallur to T.Nagar via Adyar",
+     "stops": [
+         {"stop": "Sholinganallur", "lat": 12.9000, "lon": 80.2250, "major": True},
+         {"stop": "Thiruvanmiyur", "lat": 12.9830, "lon": 80.2650, "major": False},
+         {"stop": "Adyar", "lat": 13.0060, "lon": 80.2570, "major": True},
+         {"stop": "T.Nagar", "lat": 13.0320, "lon": 80.2350, "major": True},
+     ], "ev": False},
+    {"code": "399C", "name": "399C - Chromepet to Broadway via Egmore",
+     "stops": [
+         {"stop": "Chromepet", "lat": 12.9510, "lon": 80.1530, "major": True},
+         {"stop": "Guindy", "lat": 13.0080, "lon": 80.2220, "major": True},
+         {"stop": "Egmore", "lat": 13.0790, "lon": 80.2610, "major": True},
+         {"stop": "Broadway", "lat": 13.0827, "lon": 80.2747, "major": True},
+     ], "ev": False},
 ]
 
 TARE_KG = 11000          # unladen bus
-MAX_GVW_KG = 17000       # GVW bound (~11000 tare + 6000 payload)
+MAX_GVW_KG = 17000       # fully-loaded GVW ceiling (correct MTC limit)
+MIN_GVW_KG = 15080       # typical in-service GVW floor (bus + seated load)
 PAYLOAD_LIMIT_KG = 6000  # max passenger+luggage payload
 
-DRIVER_STATES = ["NORMAL", "NORMAL", "NORMAL", "ATTENTION", "DROWSY"]
-HEALTH_STATES = ["NORMAL", "NORMAL", "NORMAL", "NORMAL", "WARNING", "INSPECTION REQUIRED"]
-VEHICLE_ANOMALIES = ["none", "none", "none", "excessive vibration", "harsh braking"]
-CROWD_LEVELS = ["NORMAL", "NORMAL", "MODERATE", "HIGH", "CRITICAL CROWDING"]
+DRIVER_STATES = ["NORMAL", "NORMAL", "NORMAL", "NORMAL", "NORMAL", "ATTENTION"]
+# Degraded states are reserved for the vehicle-attention subset; the rest of
+# the fleet stays healthy (see FleetSimulator._tick_bus).
+HEALTH_STATES = ["WARNING", "INSPECTION REQUIRED"]
+VEHICLE_ANOMALIES = ["none", "none", "none", "none", "none", "excessive vibration"]
+CROWD_LEVELS = ["NORMAL", "NORMAL", "NORMAL", "MODERATE", "HIGH"]
 
 EVENT_TYPES = [
     "DRIVER_DROWSINESS", "POTHOLE", "EMERGENCY_SIREN", "OVERLOAD",
-    "VEHICLE_ANOMALY", "CRASH", "CABIN_FIRE", "CABIN_SMOKE", "CABIN_INCIDENT",
+    "CRASH", "CABIN_FIRE", "CABIN_SMOKE", "CABIN_INCIDENT",
 ]
+# NOTE: VEHICLE_ANOMALY was removed from the demo event pool — it flooded the
+# Live Alerts / incidents pages with noise. Vehicle degradation still shows up
+# in Vehicle Health and the maintenance countdown, just not as alerts.
 
-# Fleet expansion: ~100 MTC-schedule services. Only a fraction of buses are
-# "alert-prone", so the feed stays calm even at this fleet size.
-NUM_BUSES = 100
+# Fleet expansion: 300 MTC-schedule services. Only the "attention fleet"
+# (10 vehicles, ~3%) ever develops faults, so the feed stays calm even at
+# this fleet size — the control room sees negligence on a handful of
+# vehicles, never a fleet-wide flood.
+NUM_BUSES = 300
+
+# Error budget: 5 driver-attention + 5 vehicle-attention vehicles.
+DRIVER_ATTENTION_MAX = 5
+VEHICLE_ATTENTION_MAX = 5
 
 # Average ticket price (₹) for every bus in the demo fleet.
 AVG_FARE = 18.5
@@ -315,12 +1246,26 @@ SERVICE_START_MIN = 4 * 60     # 04:00
 SERVICE_END_MIN = 23 * 60      # 23:00 (last rotation)
 SIM_MIN_PER_TICK = 2.0         # sim minutes per tick (~19 h day loops every ~9.5 min real)
 
+# Movement pacing for the live map. Displayed speed stays in km/h, but position
+# advances at KM_PER_MIN wall-clock km/min so a ~24 km route is crossed in ~2.4 min.
+KM_PER_MIN = 10.0              # viewing pace: 10 km covered per real minute
+TERMINAL_LAYOVER_TICKS = 1     # min rest at origin/destination before rescheduling (1 tick = 2 sim-min)
+
 # Relative boarding demand by hour (morning + evening rush peaks, lunch/afternoon lull).
 HOURLY_DEMAND = {
-    4: 0.25, 5: 0.5, 6: 1.0, 7: 2.2, 8: 2.6, 9: 1.9, 10: 1.2, 11: 1.0,
+    # MTC service day 5 AM → 11 PM (user spec: buses run 05:00 – 23:00).
+    # Weights mirror real Chennai demand: strong morning rush (7-9),
+    # secondary evening rush (5-8 PM), quiet midday lull.
+    5: 0.5, 6: 1.0, 7: 2.2, 8: 2.6, 9: 1.9, 10: 1.2, 11: 1.0,
     12: 0.9, 13: 0.8, 14: 0.55, 15: 0.7, 16: 1.1, 17: 1.9, 18: 2.3,
-    19: 1.6, 20: 1.0, 21: 0.6, 22: 0.3,
+    19: 1.6, 20: 1.0, 21: 0.6, 22: 0.3, 23: 0.15,
 }
+
+# Fleet-level ridership calibration: ~80,000 passengers travel across the
+# simulated fleet every service day. Per-bus daily totals are scaled from
+# this target by route size, so the busiest (longest) routes end up with
+# the highest passenger workload.
+FLEET_DAILY_PAX_TARGET = 80000
 
 
 def fare_for_stops(num_stops):
@@ -337,6 +1282,26 @@ def max_gv_kw() -> int:
     return MAX_GVW_KG
 
 
+def _ensure_gtfs_loaded():
+    """Lazy-load GTFS data on first access. Avoids blocking server startup."""
+    global ROUTES, mtc_provider
+    if ROUTES is not None:
+        return  # Already loaded
+    try:
+        from mtc_transit_provider import MTCTransitProvider
+        _provider = MTCTransitProvider(_GTFS_PATH)
+        _provider.load()
+        _all_sim_routes = _provider.to_simulator_routes()
+        _curated = [r for r in _all_sim_routes if 5 <= len(r["stops"]) <= 30]
+        _curated.sort(key=lambda r: len(r["stops"]), reverse=True)
+        ROUTES = _curated[:80]
+        mtc_provider = _provider
+        log.info("GTFS loaded lazily: %d curated routes from %d total", len(ROUTES), len(_all_sim_routes))
+    except Exception as e:
+        log.warning("GTFS load failed, using hardcoded fallback: %s", e)
+        ROUTES = _FALLBACK_ROUTES
+
+
 class FleetSimulator:
     DRIVER_NAMES = [
         "Rosina", "Karthik", "Priya", "Muthukumar", "Selvam", "Anitha",
@@ -345,11 +1310,13 @@ class FleetSimulator:
     ]
 
     def __init__(self, tick=1.0):
+        _ensure_gtfs_loaded()
         self.tick = tick
         self._stop = False
         self._thread = None
         self._next_event = {}
-        self._prone = set()          # only these buses may raise alerts
+        self._prone = set()          # driver-attention: only these raise driver alerts
+        self._attention = set()      # vehicle-attention: only these develop vehicle faults
         self._ear_hist = {}          # bus_id -> rolling EAR window (PERCLOS)
         self._prev_stage = {}        # bus_id -> last fatigue stage (transition detection)
         self.sim_minutes = SERVICE_START_MIN   # service-day clock starts 04:00
@@ -383,8 +1350,12 @@ class FleetSimulator:
             instances[route["code"]] = idx
             # bus name = "19D" for the first, "19D .2" for later buses
             bus_name = route["code"] if idx == 1 else f"{route['code']} .{idx}"
-            if created % 5 == 0 and len(self._prone) < 5:   # ~5 alert-prone services max
+            # Attention-fleet error budget: every 30th service becomes a
+            # driver-attention or vehicle-attention vehicle (5 + 5 = 10 of 300).
+            if created % 30 == 0 and len(self._prone) < DRIVER_ATTENTION_MAX:
                 self._prone.add(bus_name)
+            if created % 30 == 15 and len(self._attention) < VEHICLE_ATTENTION_MAX:
+                self._attention.add(bus_name)
             zone = zones[(created + 3) % len(zones)]
             reg_no = f"TN-01-{zone}-{reg_base + created:04d}"
 
@@ -419,7 +1390,7 @@ class FleetSimulator:
             }
             self._build_boarding_profile(bus, rng)
             store.upsert_bus(bus)
-            self._next_event[bus_name] = time.time() + rng.uniform(15, 90)
+            self._next_event[bus_name] = time.time() + rng.uniform(60, 180)
             i += 1
             created += 1
 
@@ -434,7 +1405,12 @@ class FleetSimulator:
         """
         rdef = next(r for r in ROUTES if r["code"] == bus["route_code"])
         stops = rdef["stops"]
-        total = rng.randint(540, 740)               # realistic passengers/day per bus
+        # Fleet calibration (80,000 pax/day): split the target evenly across
+        # the fleet, then give longer routes proportionally more riders so
+        # the busiest routes carry the highest workload.
+        avg_stops = sum(len(r["stops"]) for r in ROUTES) / len(ROUTES)
+        route_factor = (len(stops) / avg_stops) * rng.uniform(0.9, 1.1)
+        total = max(60, round((FLEET_DAILY_PAX_TARGET / NUM_BUSES) * route_factor))
         hours = sorted(HOURLY_DEMAND)
         sum_demand = sum(HOURLY_DEMAND[h] for h in hours)
         stop_w = [(7 if i == 0 else 4 if s["major"] else 1) for i, s in enumerate(stops)]
@@ -461,18 +1437,25 @@ class FleetSimulator:
         bus["boarding_peak_hour"] = peak_hour
 
     def _fresh_journey(self, route):
-        """Describe the stop-by-stop journey for this route."""
+        """Describe the stop-by-stop journey for this route.
+
+        The trip is directional: 'direction' flips when the bus reschedules at
+        either terminal, and origin/destination swap so the current trip's start
+        is always the blue marker and its end the red marker."""
         stops = [{"stop": s["stop"], "lat": s["lat"], "lon": s["lon"],
                   "major": s["major"], "boarded": 0} for s in route["stops"]]
         return {
             "start": stops[0]["stop"],
             "destination": stops[-1]["stop"],
+            "origin": stops[0]["stop"],
+            "direction": 1,          # +1 = forward, -1 = reverse (return trip)
             "total_stops": len(stops),
             "current_index": 0,
             "next_index": 1,
-            "state": "AT_STOP",          # AT_STOP | MOVING | ARRIVING
-            "progress": 0.0,             # 0..1 between current and next stop
-            "stops": stops,              # each has a boarded count
+            "state": "AT_STOP",      # AT_STOP | MOVING | ARRIVING
+            "progress": 0.0,         # 0..1 between current and next stop
+            "layover_ticks": 0,      # rest elapsed at the terminal
+            "stops": stops,          # each has a boarded count
         }
 
     def _fresh_energy(self, rng, is_ev):
@@ -490,8 +1473,11 @@ class FleetSimulator:
 
     def _make_load(self, payload_kg):
         payload_kg = max(0.0, min(float(payload_kg), float(PAYLOAD_LIMIT_KG)))
+        # GVW is reported within the real operating band 15,080 – 17,000 kg:
+        # the 11,000 kg chassis weight is blended up to the MIN_GVW floor so a
+        # nearly-empty bus never reports an unrealistically light GVW.
         gvw = TARE_KG + payload_kg
-        gvw = min(float(gvw), float(MAX_GVW_KG))
+        gvw = max(float(MIN_GVW_KG), min(float(gvw), float(MAX_GVW_KG)))
         pct = round(100 * payload_kg / PAYLOAD_LIMIT_KG)
         if pct > 100:
             status = "CRITICAL OVERLOAD"
@@ -526,9 +1512,10 @@ class FleetSimulator:
             d["fatigue_lt"] = round(rng.uniform(35.0, 75.0), 1)
             d["fatigue_stage"] = "ALERT" if d["fatigue_lt"] < 65 else "CRITICAL"
             d["_prev_stage"] = d["fatigue_stage"]
-        type_pool = ["DRIVER_DROWSINESS", "OVERLOAD", "VEHICLE_ANOMALY", "CABIN_INCIDENT", "DRIVER_DROWSINESS"]
-        seeds = [(0.91, "CRITICAL"), (0.78, "WARNING"), (0.83, "WARNING"),
-                 (0.70, "INFO"), (0.88, "WARNING")]
+        # VEHICLE_ANOMALY retired from the seeded demo history as well — it
+        # only added noise to Live Alerts / incidents.
+        type_pool = ["DRIVER_DROWSINESS", "OVERLOAD", "POTHOLE"]
+        seeds = [(0.91, "CRITICAL"), (0.78, "WARNING"), (0.83, "WARNING")]
         for i, (etype, (conf, sev)) in enumerate(zip(type_pool, seeds)):
             bus = rng.choice(buses)
             event = {
@@ -610,7 +1597,7 @@ class FleetSimulator:
             self._tick_bus(bus, rng)
             if bus["bus_id"] in self._prone and now >= self._next_event.get(bus["bus_id"], 0):
                 self._emit_event(bus, rng)
-                self._next_event[bus["bus_id"]] = now + rng.uniform(150, 320)
+                self._next_event[bus["bus_id"]] = now + rng.uniform(400, 700)
         # predictive health tick (runs after all bus updates)
         tick_all(store.get_buses(), rng, DataSource.SIMULATION)
         # generate health events for alerts/incidents
@@ -640,12 +1627,22 @@ class FleetSimulator:
         occ = bus["occupancy"]
         bus["load"] = self._make_load(occ["passengers"] * 68)
 
-        # vehicle health
+        # vehicle health — error budget: vehicles outside the attention set
+        # stay NORMAL; a transient warning self-heals within a few ticks, so
+        # the fleet-wide health view never floods with fault vehicles.
         v = bus["vehicle"]
-        if rng.random() < 0.015:
-            v["health"] = rng.choice(HEALTH_STATES)
+        if bus["bus_id"] in self._attention:
+            if v["health"] == "NORMAL":
+                if rng.random() < 0.010:
+                    v["health"] = rng.choice(HEALTH_STATES)
+            elif rng.random() < 0.02:
+                v["health"] = "NORMAL"          # fault attended and cleared
+        elif v["health"] != "NORMAL" and rng.random() < 0.15:
+            v["health"] = "NORMAL"              # transient blip self-heals
         v["anomaly"] = "none" if v["health"] == "NORMAL" else rng.choice(VEHICLE_ANOMALIES[1:])
-        v["vibration"] = round(min(1.0, v["vibration"] + rng.uniform(-0.03, 0.03)), 3)
+        vib_target = 0.55 if v["health"] != "NORMAL" else 0.2
+        v["vibration"] = round(min(0.85, max(0.08, v["vibration"] + rng.uniform(-0.03, 0.03)
+                                                   + (vib_target - v["vibration"]) * 0.05)), 3)
         if v["health"] == "INSPECTION REQUIRED":
             v["maintenance_priority"] = "HIGH"
         elif v["health"] == "WARNING":
@@ -653,16 +1650,35 @@ class FleetSimulator:
         else:
             v["maintenance_priority"] = "LOW"
 
+        # attention marker consumed by predictive_health (wear-rate budget)
+        bus["_attention"] = bus["bus_id"] in self._attention
         bus["last_update"] = utcnow_iso()
         # transient tracking fields are computed fresh on the next tick
         bus["driver"].pop("_prev_stage", None)
         store.upsert_bus(bus)
 
+    def _leg_km(self, j):
+        """Approximate inter-stop leg length in km (haversine, 2.0 km fallback)."""
+        a = j["stops"][j["current_index"]]
+        b = j["stops"][j["next_index"]]
+        try:
+            from road_event_model import _haversine_km
+            return max(0.1, _haversine_km(float(a["lat"]), float(a["lon"]),
+                                          float(b["lat"]), float(b["lon"])))
+        except Exception:
+            return 2.0
+
     def _advance_stop(self, bus, rng):
         """Move the bus along its stop sequence. Pauses at each stop and lets a
-        realistic number of passengers board on a ticket. Emits a stop log."""
+        realistic number of passengers board on a ticket. Emits a stop log.
+
+        Movement is distance-paced (viewing speed KM_PER_MIN) while the reported
+        speed_kmh stays a km/h figure. At each terminal the bus rests for
+        TERMINAL_LAYOVER_TICKS then reschedules: direction flips and the origin /
+        destination markers swap so the return trip starts from the old terminus."""
         j = bus["journey"]
         current = j["stops"][j["current_index"]]
+        total = j["total_stops"]
 
         if j["state"] == "AT_STOP":
             # Bus is standing at this stop.
@@ -685,38 +1701,57 @@ class FleetSimulator:
             else:
                 j["boarded_here"] = 0
 
-            # leave the stop after a short dwell
-            if rng.random() < 0.08:
-                if j["current_index"] >= j["total_stops"] - 1:
-                    # reached destination -> start return (reset journey)
-                    j["current_index"] = 0
-                    j["next_index"] = 1
-                    j["state"] = "MOVING"
-                    j["progress"] = 0.0
-                    j["_boarded_flag"] = False
-                    j["boarded_here"] = 0
+            at_terminal = j["current_index"] in (0, total - 1)
+            if at_terminal:
+                j["layover_ticks"] = j.get("layover_ticks", 0) + 1
+
+            # leave the stop after a short dwell (terminals rest at least
+            # TERMINAL_LAYOVER_TICKS then reschedule in the opposite direction)
+            if rng.random() < 0.08 and (not at_terminal or j["layover_ticks"] >= TERMINAL_LAYOVER_TICKS):
+                if at_terminal:
+                    j["direction"] = -j["direction"]
+                    first = j["stops"][0]["stop"]
+                    last = j["stops"][-1]["stop"]
+                    if j["direction"] == 1:
+                        j["origin"] = first
+                        j["destination"] = last
+                    else:
+                        j["origin"] = last
+                        j["destination"] = first
+                    j["start"] = j["origin"]
+                    j["destination"] = first if j["direction"] == -1 else last
+                    j["next_index"] = j["current_index"] + j["direction"]
+                    j["layover_ticks"] = 0
                     for s in j["stops"]:
                         s["boarded"] = 0
-                    return
                 j["state"] = "MOVING"
                 j["progress"] = 0.0
                 j["_boarded_flag"] = False
+                j["boarded_here"] = 0
         elif j["state"] == "MOVING":
-            # driving between stops — buses are always moving at a real speed
-            j["progress"] += 0.02 + rng.uniform(0, 0.012)
-            bus["speed_kmh"] = round(rng.uniform(24, 45), 1)
+            # driving between stops — position advances at the KM_PER_MIN pace,
+            # so a ~24 km route is crossed in ~2.4 min for viewing.
+            leg_km = self._leg_km(j)
+            incr = (KM_PER_MIN / 60.0) * max(0.1, self.tick) / leg_km
+            j["progress"] += incr
+            bus["speed_kmh"] = round(rng.uniform(30, 46), 1)  # display km/h value
             if j["progress"] >= 0.5:
                 j["state"] = "ARRIVING"
             else:
                 self._interp(bus, j)
         elif j["state"] == "ARRIVING":
             # slowing down as it pulls into the stop
-            j["progress"] += 0.024 + rng.uniform(0, 0.012)
+            leg_km = self._leg_km(j)
+            incr = (KM_PER_MIN / 60.0) * max(0.1, self.tick) / leg_km
+            j["progress"] += incr
             bus["speed_kmh"] = round(max(6.0, 34 - j["progress"] * 26), 1)
             if j["progress"] >= 1.0:
                 j["state"] = "AT_STOP"
                 j["current_index"] = j["next_index"]
-                j["next_index"] = min(j["current_index"] + 1, j["total_stops"] - 1)
+                j["next_index"] = j["current_index"] + j["direction"]
+                if j["next_index"] < 0 or j["next_index"] >= total:
+                    j["next_index"] = j["current_index"]  # parked at terminal until reversal
+                j["layover_ticks"] = 0
                 j["_boarded_flag"] = False
                 s = j["stops"][j["current_index"]]
                 bus["latitude"] = s["lat"] + rng.uniform(-0.001, 0.001)
@@ -725,15 +1760,46 @@ class FleetSimulator:
             else:
                 self._interp(bus, j)
         else:
-            bus["speed_kmh"] = round(rng.uniform(20, 55), 1)
+            bus["speed_kmh"] = round(rng.uniform(28, 52), 1)  # between-stop cruise
 
     def _interp(self, bus, j):
-        """Move the bus along roads (a grid-aligned EW/NS street path) rather
-        than a straight line, so it never cuts across buildings."""
+        """Move the bus along roads using GTFS shape data when available,
+        falling back to grid-aligned street path otherwise."""
+        route_code = bus.get("route_code", "")
+
+        # Try GTFS shape interpolation first (more realistic)
+        if _HAS_SHAPE_INTERPOLATOR and route_code:
+            try:
+                # Calculate overall route progress
+                current_idx = j["current_index"]
+                total_stops = j["total_stops"]
+                segment_progress = j["progress"]
+
+                # Overall progress along the route (direction-aware: the return
+                # trip traces back along the same shape instead of jumping)
+                if total_stops > 1:
+                    direction = j.get("direction", 1)
+                    route_progress = (current_idx + direction * segment_progress) / (total_stops - 1)
+                else:
+                    route_progress = 0.0
+
+                position = route_shape_manager.get_bus_position(route_code, route_progress)
+                if position:
+                    bus["latitude"] = position["lat"]
+                    bus["longitude"] = position["lon"]
+                    bus["heading"] = position["heading"]
+                    return
+            except Exception:
+                pass  # Fall through to grid-based path
+
+        # Fallback: straight stop-to-stop interpolation. The bus marker must
+        # stay exactly on the drawn route path (the line connecting the stop
+        # dots), never wander onto side streets.
         a = j["stops"][j["current_index"]]
         b = j["stops"][j["next_index"]]
-        lat, lon = self._point_on_path(self._road_path(a, b),
-                                       max(0.0, min(1.0, j["progress"])))
+        t = max(0.0, min(1.0, j["progress"]))
+        lat = a["lat"] + (b["lat"] - a["lat"]) * t
+        lon = a["lon"] + (b["lon"] - a["lon"]) * t
         bus["latitude"] = round(lat, 6)
         bus["longitude"] = round(lon, 6)
 
@@ -865,14 +1931,18 @@ class FleetSimulator:
         # ---- emission on entering CRITICAL (once per escalation, not per episode) ----
         prev_stage = self._prev_stage.get(bus["bus_id"], "WATCH")
         if prone and d["fatigue_stage"] == "CRITICAL" and prev_stage != "CRITICAL":
-            self._emit_drowsiness_event(bus)
+            # throttle: only emit once per 30 sim-minutes
+            last_drowsy = float(d.get("last_drowsy_event_min") or -999.0)
+            if self.sim_minutes - last_drowsy >= 30:
+                self._emit_drowsiness_event(bus)
+                d["last_drowsy_event_min"] = float(self.sim_minutes)
         self._prev_stage[bus["bus_id"]] = d["fatigue_stage"]
 
         # ---- start a drowsy episode when the stage allows ----
         if not in_episode:
-            chance = {"WATCH": 0.0, "ALERT": 0.04, "CRITICAL": 0.09}.get(d["fatigue_stage"], 0.0)
+            chance = {"WATCH": 0.0, "ALERT": 0.02, "CRITICAL": 0.05}.get(d["fatigue_stage"], 0.0)
             if prone:
-                chance *= 1.8
+                chance *= 1.5
             if chance and rng.random() < chance:
                 grade = (1 if rng.random() < 0.65 else 2) if d["fatigue_stage"] == "ALERT" else rng.choice([2, 3])
                 ticks_total = rng.randint(4, 10) + grade
@@ -920,7 +1990,7 @@ class FleetSimulator:
                     # cabin audio warning, throttled so a long critical day
                     # does not spam the alert feed
                     last_alert = float(d.get("last_cabin_alert_min") or -999.0)
-                    if self.sim_minutes - last_alert >= 25:
+                    if self.sim_minutes - last_alert >= 60:
                         self._emit_cabin_alert(bus)
                         d["last_cabin_alert_min"] = float(self.sim_minutes)
             d["drowsy"] = d["state"] == "DROWSY"
@@ -1073,7 +2143,7 @@ class FleetSimulator:
 
     def _emit_event(self, bus, rng):
         kind = rng.choice(EVENT_TYPES)
-        severity = rng.choices(["CRITICAL", "WARNING", "INFO"], weights=[0.25, 0.45, 0.30])[0]
+        severity = rng.choices(["CRITICAL", "WARNING", "INFO"], weights=[0.15, 0.40, 0.45])[0]
         event = {
             "bus_id": bus["bus_id"],
             "event_type": kind,
@@ -1128,6 +2198,3 @@ class FleetSimulator:
             "CABIN_INCIDENT": "cabin_ai", "DRIVER_ALERT": "driver_ai",
         }
         return mapping.get(kind, "unknown")
-
-
-simulator = FleetSimulator()

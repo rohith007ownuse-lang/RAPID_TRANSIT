@@ -5,14 +5,12 @@ Pothole Detection Module for FLEET-IQ Live Prototype.
 Receives frames from the configured road camera and runs pothole detection.
 
 IMPORTANT — Source Honesty:
-- This detector uses either:
-  a) Contour-based classical CV (HEURISTIC) — default, no trained model
-  b) YOLOv8n (COCO pre-trained) — generic object detector, NOT a trained pothole model
-- The source is ALWAYS labeled HEURISTIC in events.
+- A trained pothole YOLO model (models/best.pt) is used when available → MODEL source.
+- Without a model, falls back to contour-based classical CV → HEURISTIC source.
 - Never presents detections as "AI model" or "ML" with fabricated confidence.
-- A genuine trained pothole model would be MODEL source (not currently available).
 """
 
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -60,21 +58,22 @@ def utcnow_iso():
 # Default configuration
 POTHOLE_CONFIRMATION_FRAMES = 3
 POTHOLE_MIN_CONFIDENCE = 0.4
-POTHOLE_MODEL_PATH = "yolov8n.pt"  # Generic COCO model — NOT a pothole model
+# Trained pothole-detection model (YOLOv8s, fine-tuned on pothole datasets).
+# Lives next to this file under models/ so it survives project relocations.
+POTHOLE_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "best.pt")
 
 
 class PotholeDetector:
     """
-    Real-time pothole detection using contour-based HEURISTIC or generic YOLO fallback.
+    Real-time pothole detection with a trained YOLO pothole model + contour fallback.
 
     Source Honesty:
-    - Default mode: contour-based classical CV → source = HEURISTIC
-    - YOLO mode: generic COCO YOLOv8n (not pothole-trained) → source = HEURISTIC
-    - A genuine trained pothole model would be source = MODEL (not implemented)
+    - Trained pothole YOLO model loaded → source = MODEL (genuine detection)
+    - No model available → contour-based classical CV → source = HEURISTIC
 
     Features:
-    - Contour-based detection (HEURISTIC)
-    - YOLO inference when available (still HEURISTIC — generic model)
+    - YOLO inference with a pothole-trained model (MODEL source)
+    - Contour-based detection fallback (HEURISTIC)
     - Temporal confirmation (N consecutive frames)
     - Bounding box visualization
     - GPS integration
@@ -115,10 +114,10 @@ class PotholeDetector:
         return self._detection_source.value
 
     def load_model(self, model_path=None):
-        """Load YOLO model for pothole detection.
+        """Load the trained YOLO pothole model.
 
-        NOTE: Even with YOLO loaded, source remains HEURISTIC because
-        yolov8n.pt is a generic COCO model, not a trained pothole detector.
+        With the pothole-trained model loaded, detection source becomes MODEL.
+        Falls back to contour-based HEURISTIC detection if YOLO is unavailable.
         """
         if not _import_deps():
             print("[pothole_detector] Dependencies not available")
@@ -130,14 +129,26 @@ class PotholeDetector:
             try:
                 self._model = YOLO(path)
                 self._model_loaded = True
-                print(f"[pothole_detector] YOLO model loaded: {path} (source remains HEURISTIC — generic COCO model)")
+                self._detection_source = PotholeDetectorSource.MODEL
+                print(f"[pothole_detector] Trained pothole model loaded: {path} (source = MODEL)")
                 return True
             except Exception as e:
                 print(f"[pothole_detector] Failed to load YOLO model: {e}")
 
         print("[pothole_detector] Using contour-based detection (HEURISTIC)")
         self._model_loaded = False
+        self._detection_source = PotholeDetectorSource.HEURISTIC
         return False
+
+    def set_event_callback(self, fn):
+        """Attach a callback invoked when a confirmed pothole is detected."""
+        with self._lock:
+            self._event_callback = fn
+
+    def set_gps_source(self, fn):
+        """Attach a callable returning (latitude, longitude) or None."""
+        with self._lock:
+            self._gps_source = fn
 
     def detect(self, frame, gps_data=None):
         """
@@ -199,7 +210,10 @@ class PotholeDetector:
                         if conf >= POTHOLE_MIN_CONFIDENCE:
                             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
                             cls = int(box.cls[0])
-                            class_name = self._model.names.get(cls, "pothole")
+                            raw_name = self._model.names.get(cls, "pothole")
+                            # Some pothole checkpoints store the label as a bare
+                            # index ("0") — always surface a meaningful name.
+                            class_name = "pothole" if (not raw_name or raw_name.isdigit()) else raw_name
                             detections.append({
                                 "bbox": [x1, y1, x2, y2],
                                 "confidence": round(conf, 3),
@@ -263,7 +277,7 @@ class PotholeDetector:
             "bus_id": "PROTO-001",
             "camera_id": "road",
             "data_source": "live",
-            "confidence": best["confidence"] if source == "HEURISTIC" else None,
+            "confidence": best.get("confidence"),
             "latitude": lat,
             "longitude": lon,
             "gps_status": "FIX" if lat is not None else "NO_FIX",

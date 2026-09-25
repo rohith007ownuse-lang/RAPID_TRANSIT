@@ -196,7 +196,7 @@ class TestSimulationSeparation:
              patch("ai.driver.driver_drowsiness._detect_with_landmarker", return_value=_lm(ear=0.15)), \
              patch("ai.driver.driver_drowsiness._load_cascades"):
             d.process_frame(_frame())
-            d._eye_closed_start = time.time() - 2.0
+            d._eye_closed_start = time.time() - 2.5
             d.process_frame(_frame())
         for e in events:
             assert e["simulation"] is False
@@ -225,7 +225,7 @@ class TestGlobalAlertFlow:
              patch("ai.driver.driver_drowsiness._detect_with_landmarker", return_value=_lm(ear=0.15)), \
              patch("ai.driver.driver_drowsiness._load_cascades"):
             d.process_frame(_frame())
-            d._eye_closed_start = time.time() - 2.0
+            d._eye_closed_start = time.time() - 2.5
             d.process_frame(_frame())
         drowsy = [e for e in events if e["event_type"] == "DRIVER_DROWSINESS"]
         assert len(drowsy) >= 1
@@ -244,7 +244,7 @@ class TestGlobalAlertFlow:
              patch("ai.driver.driver_drowsiness._detect_with_landmarker", return_value=_lm(ear=0.15)), \
              patch("ai.driver.driver_drowsiness._load_cascades"):
             d.process_frame(_frame())
-            d._eye_closed_start = time.time() - 2.0
+            d._eye_closed_start = time.time() - 2.5
             for _ in range(10):
                 d.process_frame(_frame())
         drowsy = [e for e in events if e["event_type"] == "DRIVER_DROWSINESS"]
@@ -261,7 +261,7 @@ class TestGlobalAlertFlow:
             # Episode 1
             mock_lm.return_value = _lm(ear=0.15)
             d.process_frame(_frame())
-            d._eye_closed_start = time.time() - 2.0
+            d._eye_closed_start = time.time() - 2.5
             d.process_frame(_frame())
             # Recovery
             mock_lm.return_value = _lm(ear=0.45)
@@ -269,7 +269,7 @@ class TestGlobalAlertFlow:
             # Episode 2
             mock_lm.return_value = _lm(ear=0.15)
             d.process_frame(_frame())
-            d._eye_closed_start = time.time() - 2.0
+            d._eye_closed_start = time.time() - 2.5
             d.process_frame(_frame())
         drowsy = [e for e in events if e["event_type"] == "DRIVER_DROWSINESS"]
         assert len(drowsy) >= 2

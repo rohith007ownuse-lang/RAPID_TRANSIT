@@ -34,10 +34,11 @@ def utcnow_iso():
 # ---------------------------------------------------------------------------
 
 # Hourly demand profile (IST approximation, same as simulator HOURLY_DEMAND)
+# Service day runs 5 AM → 11 PM per the MTC operating spec.
 HOURLY_DEMAND = {
-    4: 0.25, 5: 0.5, 6: 1.0, 7: 2.2, 8: 2.6, 9: 1.9, 10: 1.2, 11: 1.0,
+    5: 0.5, 6: 1.0, 7: 2.2, 8: 2.6, 9: 1.9, 10: 1.2, 11: 1.0,
     12: 0.9, 13: 0.8, 14: 0.55, 15: 0.7, 16: 1.1, 17: 1.9, 18: 2.3,
-    19: 1.6, 20: 1.0, 21: 0.6, 22: 0.3,
+    19: 1.6, 20: 1.0, 21: 0.6, 22: 0.3, 23: 0.15,
 }
 
 # Stop weight by type (major terminals attract more boardings)

@@ -335,7 +335,7 @@ class TestStateMachine:
     @patch("ai.driver.driver_drowsiness._detect_with_landmarker")
     @patch("ai.driver.driver_drowsiness._load_cascades")
     def test_drowsiness_detected_after_eye_closure(self, mock_cascades, mock_detect, mock_lm):
-        """Eye closed for >= 1.3s → DROWSINESS DETECTED."""
+        """Eye closed for >= 2.3s → DROWSINESS DETECTED."""
         mock_detect.return_value = _make_landmarker_result(ear=0.15, mar=0.03, pitch=0.0)
         det = _make_detector()
         det.ear_threshold = 0.23
@@ -345,13 +345,13 @@ class TestStateMachine:
         det.process_frame(frame)
         assert det._eye_closed_start is not None
 
-        # Fast-forward: set _eye_closed_start to 2 seconds ago
-        det._eye_closed_start = time.time() - 2.0
+        # Fast-forward: set _eye_closed_start to 2.5 seconds ago
+        det._eye_closed_start = time.time() - 2.5
         result = det.process_frame(frame)
         assert "DROWSINESS" in result["state"]
         assert result["severity"] == "CRITICAL"
         assert result["drowsy"] is True
-        assert result["closed_sec"] >= 1.3
+        assert result["closed_sec"] >= 2.3
 
     @patch("ai.driver.driver_drowsiness._load_landmarker", return_value=True)
     @patch("ai.driver.driver_drowsiness._detect_with_landmarker")
@@ -397,7 +397,7 @@ class TestStateMachine:
     @patch("ai.driver.driver_drowsiness._detect_with_landmarker")
     @patch("ai.driver.driver_drowsiness._load_cascades")
     def test_head_nod_detected(self, mock_cascades, mock_detect, mock_lm):
-        """Pitch > 15° for >= 1.3s → HEAD NOD DETECTED."""
+        """Pitch > 15° for >= 2.3s → HEAD NOD DETECTED."""
         mock_detect.return_value = _make_landmarker_result(ear=0.45, mar=0.03, pitch=20.0, yaw=0.0)
         det = _make_detector()
         det.ear_threshold = 0.23
@@ -406,8 +406,8 @@ class TestStateMachine:
         # First frame: starts tracking
         det.process_frame(frame)
 
-        # Fast-forward: 1.5 seconds
-        det._head_nod_start = time.time() - 1.5
+        # Fast-forward: 2.5 seconds
+        det._head_nod_start = time.time() - 2.5
         result = det.process_frame(frame)
         assert result["state"] == "HEAD NOD DETECTED"
         assert result["severity"] == "WARNING"
@@ -451,7 +451,7 @@ class TestEventEmission:
         det.process_frame(frame)
 
         # Fast-forward past EYE_CLOSED_DURATION
-        det._eye_closed_start = time.time() - 2.0
+        det._eye_closed_start = time.time() - 2.5
         det.process_frame(frame)
 
         # Should have emitted 2 events: DRIVER_DROWSINESS + DRIVER_ALERT
@@ -484,7 +484,7 @@ class TestEventEmission:
         det.process_frame(frame)
 
         # Fast-forward to drowsiness
-        det._eye_closed_start = time.time() - 2.0
+        det._eye_closed_start = time.time() - 2.5
         det.process_frame(frame)
 
         alert_count = sum(1 for e in events if e["event_type"] == "DRIVER_ALERT")
@@ -510,7 +510,7 @@ class TestEventEmission:
         det.ear_threshold = 0.23
         frame = _make_fake_frame()
         det.process_frame(frame)
-        det._eye_closed_start = time.time() - 2.0
+        det._eye_closed_start = time.time() - 2.5
         det.process_frame(frame)
         assert det._alert_issued_for_episode is True
 
@@ -522,7 +522,7 @@ class TestEventEmission:
         # Phase 3: drowsy again → new event
         mock_detect.return_value = _make_landmarker_result(ear=0.15, mar=0.03, pitch=0.0)
         det.process_frame(frame)
-        det._eye_closed_start = time.time() - 2.0
+        det._eye_closed_start = time.time() - 2.5
         det.process_frame(frame)
         drowsy_events = [e for e in events if e["event_type"] == "DRIVER_DROWSINESS"]
         assert len(drowsy_events) >= 2

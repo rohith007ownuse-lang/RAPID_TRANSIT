@@ -329,7 +329,7 @@ Event {
 ## 10. PROJECT FILE STRUCTURE
 
 ```
-AI_Urban_Intelligence_Platform/
+Rapid-Tracker/
 │
 ├── PLAN.md                          ← THIS FILE
 ├── README.md
@@ -482,7 +482,7 @@ Font:             Inter (clean, modern)
 ### Page Layout Structure
 ```
 ┌──────────────────────────────────────────────────────────┐
-│ ☰  Urban Intelligence Control Centre    🔔 3  ⚙️  👤    │
+│ ☰  Rapid Transit Control Centre    🔔 3  ⚙️  👤    │
 ├──────┬───────────────────────────────────────────────────┤
 │      │                                                   │
 │ 📊   │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐       │
@@ -521,7 +521,7 @@ Font:             Inter (clean, modern)
 ### PHASE 1: Project Setup & DDS Core Copy ✅ DONE
 ```
 ACTIONS:
-1. Create AI_Urban_Intelligence_Platform/ directory
+1. Create Rapid-Tracker/ directory
 2. Copy DDS core files (detectors, core, utils, models, audio)
 3. Remove: Tkinter UI, vehicle control panel, Bluetooth refs
 4. Disable: serial_communicator (behind config flag)
@@ -637,7 +637,7 @@ ACTIONS:
 ```json
 {
   "system": {
-    "name": "AI Urban Intelligence Platform",
+    "name": "Rapid Transit",
     "version": "0.1.0",
     "mode": "simulation",
     "bus_id": "BUS-001"

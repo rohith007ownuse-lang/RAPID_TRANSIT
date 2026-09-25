@@ -218,7 +218,7 @@ def link_road_defect(ev: dict) -> None:
     store.upsert_road_defect(key, {
         "defect_id": key, "type": "pothole",
         "latitude": round(lat, 4), "longitude": round(lon, 4),
-        "detection_count": 1, "confidence": round(ev.get("confidence", 0.9), 2),
+        "detection_count": 1, "confidence": round(ev.get("confidence") or 0.9, 2),
         "first_detected": now, "last_detected": now, "buses": buses, "status": "ACTIVE",
         "image": image_ref, "last_image": image_ref,
     })

@@ -1,10 +1,136 @@
+# SESSION CHANGELOG — Sep 23, 2026
+
+Gap-closure roadmap Phases 10–15: mobile urban sensing (vehicle detection +
+ByteTrack counting, congestion heat map, OD analytics, pedestrian/VRU
+detection, edge AI on the bus node). All source-honest (MODEL / HEURISTIC /
+SIMULATION), 804/804 tests, frontend builds green.
+
+## Phase 10 — Traffic detection verification ✅
+- Verified `ai/road/traffic_detector.py` (YOLOv8n COCO + honest MODEL source),
+  `ai/camera_manager.py`, `server.py`, `routes.py` compile; frontend builds.
+- `yolov8n.pt` auto-downloads on first `load_model()` (network required; does
+  not touch `ai/road/models/best.pt`). `/api/traffic/stats` route registered.
+
+## Phase 11 — ByteTrack vehicle tracking ✅
+- `traffic_detector.py`: `model.track(persist=True, tracker="bytetrack.yaml")`
+  every 8 frames with carry-forward (`_last_tracked`), `_seen_track_ids`,
+  `_total_unique_all_time`, per-class uniques, tracking-active flag.
+- `server.py` `_traffic_event_callback` persists `unique_vehicles`,
+  `total_unique_vehicles`, `tracking_active` onto `bus["traffic"]`.
+- Live Fleet traffic card shows Unique (ByteTrack) + Cumulative Unique +
+  tracking-active source label.
+
+## Phase 12 — Congestion heat map ✅
+- New `backend/congestion_heatmap.py`: singleton grid (`CELL_DEG=0.004`),
+  moving=1.0 / congested(<15km/h)=3.0 weights, EMA smoothing, 300 s age-out.
+- `server.py` `_start_traffic_monitor` → `congestion_heatmap.update(buses)`.
+- Route `/api/traffic/heatmap`; `api.trafficHeatmap`; `FleetMap` `heatmap` prop
+  renders blue→amber→red cells + tooltip; Live Fleet legend.
+
+## Phase 13 — Origin–Destination analytics ✅
+- New `backend/od_analytics.py`: `compute_od()` gravity-style downstream
+  apportionment of `boarding_by_stop_hour` (HEURISTIC, honest caveat).
+- Route `/api/od/analytics`; `api.odAnalytics`; Analytics page OD card
+  (top-12 pairs, riders/buses/routes KPIs) polled every 15 s.
+
+## Phase 14 — Pedestrian / vulnerable-road-user detection ✅
+- New `backend/ai/road/pedestrian_detector.py`: COCO person (class 0),
+  conf ≥0.35, ByteTrack on 8-frame cadence, module-level `_near_roadway`
+  bbox-geometry heuristic (bottom 55% + height ≥18% of frame), honest
+  PEDESTRIAN_PRESENCE events (never on absence, no age/group inference).
+- `ai/camera_manager.py` runs the ROAD-slot pedestrian pass every 6 frames;
+  redraw overlay splits pedestrian detections; `server.py`
+  `_pedestrian_event_callback` persists `bus["pedestrians"]`.
+- Route `/api/pedestrian/stats`; `api.pedestrianStats`; Live Fleet card.
+
+## Phase 15 — Edge AI on the bus node ✅
+- New `bus_node/ai_modules/edge_traffic_detector.py`: runs YOLOv8 COCO +
+  ByteTrack ON the bus, streams only derived `TRAFFIC_COUNT` counts/events over
+  the existing WS client (no raw frames → bandwidth-minimized), throttled to
+  ~1 report / infer interval, honest no-op when the ROAD camera is a
+  placeholder (never fabricates a count), `edge: True` + MODEL source labels.
+- `bus_node/main.py`: `--edge-traffic` flag opens a real ROAD camera when a
+  device index resolves, wires `frame_source → EDGE detector → client.send_event`,
+  stops cleanly in `finally`.
+- Backend WS handler (`websocket_handler.py`) already accepts `{"type":"event"}`
+  with `event_type == "TRAFFIC_COUNT"` → `store.add_event` (no change needed).
+- 6 new tests in `tests/test_traffic_pedestrian_od.py` (source honesty,
+  heatmap weights, OD empty-source honesty, pedestrian geometry).
+
+## Verification
+- Backend: `venv/bin/python -m pytest -q` → **804 passed**.
+- Frontend: `npm run build` → green.
+- All new modules compile (`traffic_detector`, `pedestrian_detector`,
+  `congestion_heatmap`, `od_analytics`, `bus_node/main.py`,
+  `edge_traffic_detector`); road detectors linked OK.
+- Endpoints return 200: `/api/traffic/stats`, `/api/traffic/heatmap`,
+  `/api/pedestrian/stats`, `/api/od/analytics` (content populates on sim
+  warm-up; heatmap/OD content needs running simulator data).
+
+# SESSION CHANGELOG — Sep 13, 2026
+
+Fleet error budget (10 of 300 vehicles) + traffic red-alert water-drop ripples
+with 500 m super-hotspot merge + patent doc refresh + orphaned-alarm audio fix.
+
+## Audio: "sound plays without starting Rapid Transit" — ROOT-CAUSED & FIXED
+- Symptom: `bash -c while true; do aplay tone_critical.wav; done` loops kept
+  playing after Rapid Transit exited (orphaned alarms).
+- Root causes: (a) alarm is an infinite bash loop; when the backend died the
+  daemon thread that would call stop() died silently, leaving the loop;
+  (b) `feature_toggles.json` had `audio_alerts: true`, overriding the
+  documented `AlertManager.muted = True` kill-switch at runtime; (c) stray-
+  loop cleanup only ran when muted, so (b) also disabled the cleanup.
+- Fixes: `feature_toggles.json`/`feature_toggles.py` → `audio_alerts: false`
+  (default OFF); `alert_manager.py` hardened — stray-loop sweep at EVERY
+  construction + 15 s daemon watchdog + process-group kill (SIGTERM→SIGKILL,
+  `start_new_session=True`) in `stop()`.
+- Verified: 45 s of running server with DDS firing WARNING/CRITICAL → 82 mute
+  decisions logged, zero `aplay`/loop processes; 754/754 tests pass.
+
+## Backend
+- `simulator.py` — `NUM_BUSES = 300`; error budget: `DRIVER_ATTENTION_MAX = 5` +
+  `VEHICLE_ATTENTION_MAX = 5` (`_prone` / `_attention` sets, every 30th service,
+  no overlap). Non-attention vehicles stay `NORMAL` (transient warnings
+  self-heal, vibration mean-reverts); `_attention` marker stored on each bus.
+- `predictive_health.py` — wear-rate budget: healthy-vehicle tyre/vibration/
+  energy counters decay to healthy baseline (attention vehicles still degrade);
+  harsh-braking increment scaled to its thresholds (was +1.0 → instant CRITICAL
+  on every vehicle — the root cause of fleet-wide anomaly spam); healthy rate
+  0.01/0.04 vs decay −0.02. `generate_health_events()` gated to attention
+  vehicles + live nodes; per-(bus, component) 10-min alert cooldown map.
+- `traffic_engine.py` — 500 m super-hotspot merge: ≥3 active hotspots within
+  500 m (union-find on centroids) → ONE CRITICAL zone (unioned buses, peak
+  duration, `radius_m: 500`, member ids); `analytics()` exposes
+  `super_hotspots`/`super_count`.
+- `server.py`, `routes.py`, `data_source_manager.py` — "300 buses" strings.
+
+## Frontend
+- `FleetMap.jsx` — red alerts render as water-drop ripples (drop core + 3
+  staggered expanding circular rings, CSS transform keyframes); merged
+  super-hotspots render as one big red circular waveform (500 m zone circle +
+  3 large slow waves + glowing core, CRITICAL tooltip).
+- `Layout.jsx` (ESTIMATED · 300 buses), `FeatureToggles.jsx`.
+
+## Docs
+- `patent/generate_rapid_tracker_doc.py` + regenerated `.docx` — 300-vehicle
+  scale, 10-vehicle error budget, super-hotspot merge + ripple visualisation
+  (§14.20, §14.23, objectives, observations, config tables).
+- `PROJECT_CONTEXT.md` — fleet scale + error budget documented.
+
+## Verification
+- 754/754 backend tests pass; `npm run build` clean.
+- Live run: 300 buses; all new events over 90 s came ONLY from the 10
+  attention vehicles; super-hotspot merge unit-verified (4 zones → 1 CRITICAL).
+
+---
+
 # SESSION CHANGELOG — Sep 6, 2026 (evening)
 
 Complete record of every change made in this session (Original DDS embedded in
 the FLEET-IQ Live Prototype + all hotfixes). Companion to `SESSION_RECALL.md`
 (high-level memory) and `ai_urban_management.md` (phase log).
 
-**Project root:** `/home/rohith/Desktop/AI_Urban_Intelligence_Platform/`
+**Project root:** `/home/rohith/Desktop/Rapid-Tracker/`
 
 ---
 
@@ -148,3 +274,48 @@ PYTHONUNBUFFERED=1 setsid venv/bin/python server.py --start-mode live \
   live DDS events/data.
 - Cabin AI remains an honest placeholder (never fabricates detections).
 - No accuracy/precision/F1/FPS claims unless measured.
+---
+
+## 7. Pothole detection — trained YOLO model (Option A)
+
+- Added trained pothole model `ai/road/models/best.pt` (YOLOv8s, fine-tuned on
+  pothole datasets, from `peterhdd/pothole-detection-yolov8` on Hugging Face,
+  AGPL-3.0).
+- Installed `ultralytics` + CPU torch in the backend venv.
+- `pothole_detector.py`: `POTHOLE_MODEL_PATH` now points at the local trained
+  model; detection source is `MODEL` when it loads (contour HEURISTIC remains
+  the fallback); added `set_event_callback()` / `set_gps_source()`; event
+  confidence is always a real number; pothole class label always shown as
+  "pothole".
+- `server.py`: `_road_event_callback()` wired in `_setup_live_proto()` —
+  confirmed potholes now land in the event system, the road-defect map
+  (`link_road_defect`), Road Intelligence zones, and alert subscribers.
+- `websocket_handler.py`: `link_road_defect` tolerates `confidence=None`.
+- Verified: 739/739 tests pass; real pothole image → 1 detection (MODEL,
+  conf 0.461); no-road image → 0 detections; temporal confirmation fires the
+  POTHOLE event. Backend restarted; live mode switch in the UI activates the
+  engine.
+
+---
+
+## 8. Cabin hazard detection — fire & smoke (trained D-Fire model)
+
+- Added trained fire/smoke model `ai/cabin/models/best.pt` (YOLOv8n,
+  fine-tuned on the D-Fire dataset, from `rabahdev/fire-smoke-yolov8n` on
+  Hugging Face).
+- `cabin_detector.py` rewritten from an honest stub into a real detector:
+  fire + smoke detection with temporal confirmation (2 frames fire, 3
+  smoke), 10 s per-type cooldown, `CABIN_FIRE` (CRITICAL) and `CABIN_SMOKE`
+  (HIGH) events, red/slate bounding-box overlay, `set_event_callback()`.
+  No fabricated detections when the model is unavailable.
+- `server.py`: `_cabin_event_callback()` wired in `_setup_live_proto()` —
+  confirmed hazards land in the event system with bus GPS and keep the node
+  alive.
+- `camera_manager.py`: cabin branch now draws the detector overlay on the
+  stream (fire/smoke boxes visible on the live feed), matching the road
+  branch.
+- `CameraFeed.jsx`: cabin panel shows a live hazard banner (FIRE / SMOKE /
+  no hazards) above the occupancy stats.
+- Verified: real fire image → `fire` conf 0.452, CRITICAL CABIN_FIRE event on
+  2nd frame; non-fire image → 0 detections; 739/739 tests pass; backend +
+  frontend rebuilt and healthy.

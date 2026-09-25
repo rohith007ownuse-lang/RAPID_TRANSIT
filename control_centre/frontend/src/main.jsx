@@ -4,6 +4,7 @@ import { BrowserRouter } from 'react-router-dom'
 import { ModeProvider } from './lib/modeContext.jsx'
 import { AuthProvider, useAuth } from './lib/authContext.jsx'
 import { onUnauthorized } from './api.js'
+import ErrorBoundary from './components/ErrorBoundary.jsx'
 import App from './App.jsx'
 import './theme.css'
 
@@ -32,8 +33,10 @@ function Root() {
 
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
-    <BrowserRouter>
-      <Root />
-    </BrowserRouter>
+    <ErrorBoundary>
+      <BrowserRouter>
+        <Root />
+      </BrowserRouter>
+    </ErrorBoundary>
   </React.StrictMode>,
 )

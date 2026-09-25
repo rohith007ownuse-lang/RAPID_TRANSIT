@@ -1,6 +1,9 @@
 import { NavLink, Link, useNavigate } from 'react-router-dom'
 import { useState, useEffect, useRef } from 'react'
 import IncomingCall from './IncomingCall.jsx'
+import CriticalIncidentPopup from './CriticalIncidentPopup.jsx'
+import NotificationTray from './NotificationTray.jsx'
+import { BrandLogo } from './UI.jsx'
 import { useMode } from '../lib/modeContext.jsx'
 import { useAuth } from '../lib/authContext.jsx'
 import { api } from '../api.js'
@@ -11,23 +14,29 @@ const NAV = [
   { to: '/driver-safety', label: 'Driver Safety', icon: '👁️' },
   { to: '/load-management', label: 'Load Management', icon: '⚖️' },
   { to: '/incidents', label: 'Incidents', icon: '🚨' },
+  { to: '/emergency', label: 'Emergency', icon: '🆘' },
   { to: '/roads', label: 'Road Intelligence', icon: '🛣️' },
+  { to: '/ai-suggestions', label: 'AI Suggestions', icon: '🤖' },
+  { to: '/routes', label: 'Route Map', icon: '🗺️' },
+  { to: '/route-intelligence', label: 'Route Intel', icon: '📊' },
+  { to: '/historical', label: 'Historical', icon: '📅' },
   { to: '/health', label: 'Vehicle Health', icon: '🔧' },
   { to: '/analytics', label: 'Analytics', icon: '📈' },
 ]
 
 const ADMIN_NAV = [
   { to: '/settings', label: 'Settings', icon: '⚙️' },
+  { to: '/features', label: 'Feature Toggles', icon: '🎛️' },
   { to: '/users', label: 'Users', icon: '👥' },
 ]
 
 export function Brand() {
   return (
     <div className="brand">
-      <div className="brand-logo">FQ</div>
+      <BrandLogo size={34} />
       <div>
-        <div className="brand-name">FLEET-IQ</div>
-        <div className="brand-sub">Urban Intelligence</div>
+        <div className="brand-name">Rapid Transit</div>
+        <div className="brand-sub">City Public Transport</div>
       </div>
     </div>
   )
@@ -45,7 +54,7 @@ function ModeSwitcher() {
           onClick={() => switchMode('simulation')}
           disabled={switching}
         >
-          ◈ SIMULATION
+          ◈ ESTIMATED
         </button>
         <button
           className={`mode-btn ${mode === 'live' ? 'active' : ''}`}
@@ -58,15 +67,13 @@ function ModeSwitcher() {
       {mode === 'simulation' && (
         <div className="mode-status mode-status-sim">
           <span className="mode-status-dot dot-blue" />
-          SIMULATION · 100 buses
+          ESTIMATED · 300 buses
         </div>
       )}
       {mode === 'live' && (
-        <div className={`mode-status ${liveStatus.connected ? 'mode-status-live' : 'mode-status-waiting'}`}>
-          <span className={`mode-status-dot ${liveStatus.connected ? 'dot-green' : 'dot-amber'}`} />
-          {liveStatus.connected
-            ? `LIVE · ${liveStatus.connected_count} node(s)`
-            : 'WAITING FOR PROTOTYPE'}
+        <div className="mode-status mode-status-live">
+          <span className="mode-status-dot dot-green" />
+          LIVE PROTOTYPE
         </div>
       )}
     </div>
@@ -181,13 +188,15 @@ export default function Layout({ children }) {
         ))}
         <div className="nav-section session">
           <div className="session-user">{user?.username}</div>
-          <div className="session-role">{user?.role}</div>
+          {user?.role && user?.role !== user?.username && <div className="session-role">{user?.role}</div>}
           <button className="btn btn-sm btn-ghost" onClick={handleLogout}>Logout</button>
         </div>
       </aside>
       <main className="main">{children}</main>
       <IncomingCall />
       <DrowsinessAlert />
+      <NotificationTray />
+      <CriticalIncidentPopup />
     </div>
   )
 }
@@ -208,8 +217,8 @@ export function SimBadge({ show = true }) {
   const { isSimulation } = useMode()
   if (!show) return null
   return isSimulation ? (
-    <span className="sim-badge" title="All data on this page is synthetic demo data, not real sensor measurement.">
-      ◈ SIMULATION
+    <span className="sim-badge" title="All data on this page is estimated demo data, not real sensor measurement.">
+      ◈ ESTIMATED
     </span>
   ) : (
     <span className="live-badge" title="Live prototype data from connected hardware.">
@@ -222,7 +231,7 @@ export function DataBadge({ dataSource }) {
   if (dataSource === 'live') {
     return <span className="live-badge">● LIVE</span>
   }
-  return <span className="sim-badge">◈ SIM</span>
+  return <span className="sim-badge">◈ DEMO</span>
 }
 
 export function BreadcrumbBus({ busId }) {
