@@ -7,6 +7,11 @@ node_modules/
 dist/
 build/
 
+# Runtime state the app writes itself (fresh clones regenerate defaults).
+# NOTE: feature_toggles.json must stay untracked — the Features page writes
+# live toggle choices into it, and those must never be committed.
+control_centre/backend/feature_toggles.json
+
 # Environments
 venv/
 .venv/
