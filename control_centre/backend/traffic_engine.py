@@ -2,12 +2,19 @@
 traffic_engine.py
 Traffic heat-map engine — detects congestion hotspots from live bus positions.
 
-A high-traffic area ("red dot") is declared when five or more buses are within
-HOTSPOT_RADIUS_M of each other for longer than ACTIVE_WINDOW_SEC. When six or
-more active red dots cluster within SUPER_RADIUS_M they are reported as ONE
-large merged zone that only BLINKS (no expanding waves). Active hotspots are
-surfaced to the dashboard / live-feed map and to the analytics page as
+A high-traffic area ("red dot") is declared when EIGHT or more buses are within
+HOTSPOT_RADIUS_M (50 m) of each other for longer than ACTIVE_WINDOW_SEC. When
+six or more active red dots cluster within SUPER_RADIUS_M they are reported as
+ONE large merged zone that only BLINKS (no expanding waves). Active hotspots
+are surfaced to the dashboard / live-feed map and to the analytics page as
 congestion telemetry.
+
+Because clustering links neighbours, a queue of buses queued 50 m apart forms
+one connected cluster that spans hundreds of metres. A red hotspot has to mean
+"this many buses inside one radius", so every cluster is reduced to its DENSEST
+CORE — the largest subset that genuinely fits inside HOTSPOT_RADIUS_KM — and
+that core is what gets counted, located and reported. A long thin queue of
+eight buses therefore never lights up red.
 
 HONESTY: this is a positional detector over whatever bus data the store holds
 (simulation or live). It never fabricates a hotspot — a spot only lights up when
@@ -20,11 +27,16 @@ import math
 from datetime import datetime, timezone
 
 # Detection parameters
-HOTSPOT_RADIUS_M = 150.0
+HOTSPOT_RADIUS_M = 50.0
 HOTSPOT_RADIUS_KM = HOTSPOT_RADIUS_M / 1000.0
-MIN_BUSES = 5                 # five or more buses ...
-ACTIVE_WINDOW_SEC = 60.0      # ... together for more than one minute
-MATCH_KM = HOTSPOT_RADIUS_KM  # reuse an existing hotspot when centroids are this close
+MIN_BUSES = 8                 # eight or more buses ...
+ACTIVE_WINDOW_SEC = 60.0      # ... together inside one 50 m circle for over a minute
+
+# Hotspot IDENTITY radius, deliberately wider than the detection radius. A jam
+# that crawls along a corridor must keep the same hotspot (and the same 60 s
+# activation timer) instead of shedding a trail of brand-new spots behind it.
+MATCH_RADIUS_M = 150.0
+MATCH_KM = MATCH_RADIUS_M / 1000.0
 EVICT_AFTER_SEC = 120.0
 
 # Super-hotspot merge: six or more active red dots (hotspots) whose centroids
@@ -92,6 +104,27 @@ def _valid_pos(b):
     return isinstance(lat, (int, float)) and isinstance(lon, (int, float))
 
 
+def _densest_core(cluster):
+    """Reduce a linked cluster to the largest subset inside one radius.
+
+    `_cluster_buses` links neighbours, so buses queued 50 m apart end up in one
+    component that can span hundreds of metres. A red hotspot must mean "N
+    buses within R metres", so the reported zone is the densest sub-group that
+    genuinely fits inside HOTSPOT_RADIUS_KM — measured from a real bus
+    position, not from a centroid that might sit outside the group.
+
+    Returns the densest subset (a list of point dicts), or [] if there is none.
+    """
+    best = []
+    for anchor in cluster:
+        within = [p for p in cluster
+                  if _haversine_km(anchor["latitude"], anchor["longitude"],
+                                   p["latitude"], p["longitude"]) <= HOTSPOT_RADIUS_KM]
+        if len(within) > len(best):
+            best = within
+    return best
+
+
 class TrafficMonitor:
     """Tracks sustained bus bunches and exposes active traffic hotspots."""
 
@@ -114,15 +147,20 @@ class TrafficMonitor:
             for cluster in clusters:
                 if not cluster:
                     continue
-                c_lat = sum(p["latitude"] for p in cluster) / len(cluster)
-                c_lon = sum(p["longitude"] for p in cluster) / len(cluster)
+                # Only the dense core counts — a spread-out chain of neighbours
+                # is not "N buses within HOTSPOT_RADIUS_M".
+                core = _densest_core(cluster)
+                if not core:
+                    continue
+                c_lat = sum(p["latitude"] for p in core) / len(core)
+                c_lon = sum(p["longitude"] for p in core) / len(core)
                 hid, hotspot = self._match_hotspot(c_lat, c_lon, now)
                 seen.add(hid)
 
                 hotspot["last_sighting"] = now
-                hotspot["count"] = len(cluster)
-                hotspot["bus_ids"] = sorted(p["bus_id"] for p in cluster)
-                hotspot["max_count"] = max(hotspot.get("max_count", 0), len(cluster))
+                hotspot["count"] = len(core)
+                hotspot["bus_ids"] = sorted(p["bus_id"] for p in core)
+                hotspot["max_count"] = max(hotspot.get("max_count", 0), len(core))
                 hotspot["centroid"] = [round(c_lat, 5), round(c_lon, 5)]
 
                 # Consecutive-active bookkeeping with a small hysteresis so a
@@ -130,7 +168,7 @@ class TrafficMonitor:
                 # NOTE: a fresh activation always starts at `now` — backdating
                 # with the absolute dip timestamp produced epoch-era
                 # active_since values and absurd durations.
-                if len(cluster) >= MIN_BUSES:
+                if len(core) >= MIN_BUSES:
                     if hotspot.get("active_since") is None:
                         hotspot["active_since"] = now
                     hotspot["dip_since"] = None
@@ -306,6 +344,9 @@ class TrafficMonitor:
             "duration_sec": duration,
             "first_sighted": h.get("first_sighting"),
             "last_sighted": h.get("last_sighting"),
+            # The rule that produced this dot, so the UI never has to hardcode it.
+            "radius_m": HOTSPOT_RADIUS_M,
+            "min_buses": MIN_BUSES,
         }
 
 

@@ -29,6 +29,13 @@ bus_node/src/yolov8n.pt
 *.db-shm
 *.db-wal
 
+# Agent / editor tooling (local only, never published)
+.codex/
+.opencode/
+.claude/
+.cursor/
+.session-recall/
+
 # Graphify knowledge graph — local tooling output only, never uploaded.
 # The graph still works locally; it is simply not part of the repository.
 graphify-out/

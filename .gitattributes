@@ -1,1 +1,2 @@
-graphify-out/graph.json merge=graphify
+# (merge drivers for vendored tooling live here; graphify output is ignored,
+# so no merge driver for it is needed.)

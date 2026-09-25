@@ -438,7 +438,7 @@ export default function FleetMap({
           </Marker>
         )}
 
-        {/* Traffic hotspots (5+ buses in a 150 m radius for >60 s): red dot
+        {/* Traffic hotspots (8+ buses inside a 50 m circle for >60 s): red dot
             core + expanding red wave rings. Merged zones (6+ red dots within
             200 m) render as ONE big ring that only BLINKS. */}
         {hotspots?.length > 0 && hotspots.map((h) => h.merged ? (
@@ -495,7 +495,7 @@ export default function FleetMap({
               <Tooltip direction="top">
                 <div style={{ fontSize: 11 }}>
                   <strong style={{ color: '#dc2626' }}>⚠ Traffic red dot</strong>
-                  <div>{h.bus_count} buses in a 150 m radius</div>
+                  <div>{h.bus_count} buses in a {h.radius_m ?? 50} m radius</div>
                   {h.duration_sec != null && <div className="muted">active {Math.round(h.duration_sec)}s</div>}
                 </div>
               </Tooltip>

@@ -1,154 +1,150 @@
-# AI-Powered Mobile Urban Intelligence Platform
+# FLEET-IQ — AI-Powered Mobile Urban Intelligence Platform
+
+[![CI](https://github.com/rohith007ownuse-lang/fleet-iq/actions/workflows/ci.yml/badge.svg)](https://github.com/rohith007ownuse-lang/fleet-iq/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](control_centre/backend/requirements.txt)
+[![Node 20+](https://img.shields.io/badge/node-20%2B-green.svg)](control_centre/frontend/package.json)
 
 Convert public-transport buses into distributed mobile sensing and intelligence nodes.
 
-Each bus continuously collects driver safety, cabin safety, road conditions, crash/
+Each bus continuously collects driver safety, cabin safety, road conditions, crash /
 impact events, emergency situations, vehicle load, vehicle health, and fleet location,
 then sends structured events to a centralized Control Centre / Urban Intelligence Dashboard.
 
 > **Research & demonstration prototype.** This is NOT an automotive-certified safety system.
+> Every value on screen carries a source label — `SIMULATION`, `MODEL`, `HEURISTIC`, or `LIVE`
+> — and the platform never presents estimates as measurements. See [docs/DATA_SOURCES.md](docs/DATA_SOURCES.md).
 
 ---
 
-## Status Legend
+## What it does
+
+| Capability | Where |
+|---|---|
+| Operator dashboard: fleet KPIs, incidents, attention queue, maps | `control_centre/frontend` (React + Vite + Leaflet) |
+| REST API + real-time bus ingest over WebSockets | `control_centre/backend` (Flask) |
+| Driver drowsiness (EAR/MAR/head-pose, MediaPipe) | `control_centre/backend/ai/driver` |
+| Cabin fire & smoke detection (trained YOLOv8n, D-Fire) | `control_centre/backend/ai/cabin` |
+| Cabin occupancy intelligence (heuristic + optional real model) | `control_centre/backend/ai/cabin/occupancy.py` |
+| Pothole / road-defect detection (trained YOLOv8n) | `control_centre/backend/ai/road` |
+| Traffic detection + ByteTrack counting, congestion heat map | `control_centre/backend/traffic_engine.py`, `congestion_heatmap.py` |
+| Congestion hotspots → red map alert at **8+ buses inside 50 m** | `control_centre/backend/traffic_engine.py` |
+| Risk engine, AI actions, predictive health, ETA, demand, road risk | `control_centre/backend/*.py` |
+| Incident correlation, assignment & lifecycle | `control_centre/backend/incident_intelligence.py` |
+| Historical & operational analytics | `control_centre/backend/analytics_intelligence.py` |
+| System health, degraded modes, resilience | `control_centre/backend/system_health.py` |
+| Bus-side node: sensors, event fusion, alerts | `bus_node/` |
+| One-command demo deployment (server or tunnel) | `deploy/` |
+
+## Status legend
 
 | Label | Meaning |
-|-------|---------|
+|---|---|
 | **IMPLEMENTED** | Functionality currently working. |
 | **PROTOTYPE** | Working in simulation/demo only; real hardware pending. |
 | **PLANNED** | Architecture reserved; not yet functional. |
 
-## Current Status
-
 | Module | Status |
-|--------|--------|
-| Driver monitoring (EAR/MAR/head-pose/drowsiness) | **IMPLEMENTED** (ported from DDS) |
+|---|---|
+| Driver monitoring (EAR/MAR/head-pose/drowsiness) | **IMPLEMENTED** |
 | Calibration | **IMPLEMENTED** |
 | Audio alert tones | **IMPLEMENTED** |
-| Event logging | **IMPLEMENTED** |
-| Control Centre web UI (map + live fleet, per-bus ticketing/fare) | **IMPLEMENTED** (simulated data, clearly labeled) |
-| 100-bus Chennai MTC fleet simulator (TN registration no's, 14 corridors) | **IMPLEMENTED** (simulated data) |
-| Per-bus ticket machine counters (tickets sold, fare collected ₹) | **IMPLEMENTED** (simulated MTC ticket-machine data) |
-| Cabin driver drowsiness alert (audio warning + Control Centre notify) | **IMPLEMENTED** (simulated DROWSY → DRIVER_ALERT event) |
-| Operator Intercom (call driver / driver calls operator, transcript, speech) | **IMPLEMENTED** (in-app call store; simulated) |
-| Risk engine · AI actions · predictive health · ETA · demand · road risk | **IMPLEMENTED** (simulated; see `control_centre/IMPLEMENTATION_PLAN.md`) |
-| Backend REST API + fleet simulation | **IMPLEMENTED** (simulated data) |
-| Camera Manager (3 slots, 1 active) | **IMPLEMENTED** (DRIVER webcam live; CABIN/ROAD planned placeholders) |
-| FLEET-IQ LIVE PROTOTYPE mode (webcam AI perception: driver DDS / pothole / cabin) | **IMPLEMENTED** (live webcam; sim/live switchable from the UI) |
-| Original DDS embedded in the Live Prototype camera feed (calibration, monitoring, audio warning, events) | **IMPLEMENTED** (live webcam, verified — see `ai_urban_management.md` PHASE 11) |
-| Sensor interfaces (GPS / IMU / load / mic) | **IMPLEMENTED** (simulation only; clearly labeled) |
-| Event model + bus state manager | **IMPLEMENTED** |
-| Event Fusion Engine | **IMPLEMENTED** (crash/drowsy/overload/siren rules, pothole dedup) |
-| Bus-node ↔ Control Centre link | **IMPLEMENTED** (WebSocket; simulated payloads) |
-| GPS / IMU / Load / Microphone interfaces (real HW) | **PLANNED** (hardware not mounted) |
-| Event Fusion Engine (real-HW inputs) | **PLANNED** |
-| Event Fusion Engine | **PLANNED** |
-| Bus-node ↔ Control Centre live link | **PLANNED** |
-| Automatic braking | **DISABLED** — drowsiness only produces a brake *recommendation*; the Control Centre decides after human review |
+| Event logging + SQLite persistence | **IMPLEMENTED** |
+| Control Centre web UI (map + live fleet + operator console) | **IMPLEMENTED** (simulated data, clearly labeled) |
+| 100-bus Chennai MTC fleet simulator | **IMPLEMENTED** (simulated data) |
+| Per-bus ticket machine counters (tickets sold, fare collected ₹) | **IMPLEMENTED** (simulated) |
+| Operator intercom (call driver / transcript) | **IMPLEMENTED** (simulated) |
+| Risk engine · AI actions · predictive health · ETA · demand · road risk | **IMPLEMENTED** (simulated) |
+| Traffic hotspots (8+ buses in 50 m for >60 s → red dot) | **IMPLEMENTED** (simulated) |
+| Camera manager: driver + cabin live, road test slot | **IMPLEMENTED** (DRIVER + CABIN live; ROAD planned) |
+| LIVE PROTOTYPE mode (webcam AI: driver DDS / pothole / cabin) | **IMPLEMENTED** (live webcam; sim/live switchable in UI) |
+| Cabin fire/smoke detection (trained D-Fire model) | **IMPLEMENTED** (live webcam) |
+| Sensor interfaces (GPS / IMU / load / mic) | **IMPLEMENTED** (simulation only, clearly labeled) |
+| Public deployment (single-host VPS or tunnel) | **IMPLEMENTED** — see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) |
 
-See `ai_urban_management.md` for the running phase log.
-
----
-
-## Project Layout
+## Repository layout
 
 ```
-Rapid-Tracker/
-├── PLAN.md                     ← Architecture, flow diagrams, phases
-├── config/system_config.json   ← All thresholds + bus/sensor settings
-├── bus_node/                   ← Python code that runs on each bus
-│   ├── main.py                 ← Entry point (driver monitoring)
-│   ├── core/                   ← FatigueEngine, severity
-│   ├── detectors/              ← EAR, MAR, head pose, face landmarker
-│   ├── cameras/  sensors/  ai_modules/  event_fusion/  data/
-│   ├── communication/          ← Future WebSocket link to Control Centre
-│   ├── hardware/               ← Serial communicator (disabled)
-│   └── utils/                  ← Calibration, alerts, config, logging
-├── control_centre/             ← Web dashboard (React + Flask) [Phase 2+]
-│   ├── backend/                ← Flask API, fleet simulator, risk/ETA/demand engines
-│   │   └── ai/                 ← FLEET-IQ live prototype: camera_manager, driver DDS,
-│   │                             pothole, cabin placeholder, DDS subprocess bridge
-│   └── frontend/               ← React pages incl. Live Prototype (PROTO-001) view
-├── arduino/                    ← Vehicle firmware (motor control disabled)
-└── assets/  data/              ← Map, audio tones, logs
+fleet-iq/
+├── control_centre/
+│   ├── backend/        # Flask REST API, WebSocket ingest, AI engines, simulator
+│   └── frontend/       # React operator console (Vite)
+├── bus_node/           # On-bus node: sensors, detectors, event fusion, alerts
+├── deploy/             # Production deployment: systemd, nginx, VPS provisioner, tunnel demo
+├── docs/               # Architecture, API, deployment, data-source honesty, dev guide
+├── scripts/            # GIS / facility-pin helpers
+├── arduino/            # Drowsiness-guard car prototype firmware
+├── config/             # system_config.json
+├── assets/ branding/   # Images and brand material
+└── data/               # Alert tones
 ```
 
----
+## Quickstart
 
-## Running the Bus Node (Phase 1)
-
-From the project root:
+Prerequisites: Python 3.12+, Node 20+.
 
 ```bash
-# Using the same Python environment as DDS (deps already installed):
-/home/rohith/Documents/D.D.S/DriverDrowsinessDetectionSystem/venv/bin/python bus_node/main.py
-
-# Or with a custom camera index:
-.../venv/bin/python bus_node/main.py --camera-index 1
-```
-
-Run from `Rapid-Tracker/` so `config/system_config.json` is found.
-
-The full bus-node pipeline (Phase 8): cameras + driver monitoring + simulated
-sensors + event fusion + WebSocket stream to the Control Centre:
-
-```bash
-python bus_node/main.py                      # interactive (calibration window)
-python bus_node/main.py --headless --duration 60   # no GUI, auto-stop
-# --no-ws runs offline; --ws-url ws://HOST:PORT overrides the default
-```
-
----
-
-## Control Centre (web dashboard)
-
-```bash
-# Backend (simulated fleet + REST API + WebSocket ingestion)
+# Backend — REST on :5001, bus WebSocket on :8765, camera WebSocket on :8766
 cd control_centre/backend
-python3 -m venv venv
-venv/bin/pip install -r requirements.txt
-venv/bin/python server.py            # REST http://127.0.0.1:5001, WS ws://127.0.0.1:8765
+python3 -m venv venv && venv/bin/pip install -r requirements.txt
+venv/bin/python server.py            # simulation mode by default
 
-# Frontend (React dashboard)
+# Frontend — operator console (proxies /api to the backend)
 cd ../frontend
 npm install
 npm run dev                          # http://localhost:5173
 ```
 
-Open http://localhost:5173 . All dashboard data is simulated and labeled as such.
-Run `bus_node/main.py` after the backend to see the bus node stream live
-(simulated) telemetry into the dashboard. See `control_centre/README.md`.
+Open http://localhost:5173, log in (`admin` / `admin123` — development only,
+change it before any real use), and explore the dashboard. Every page shows a
+`SIMULATION` badge until real bus nodes connect. Full developer guide:
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
-### LIVE PROTOTYPE mode (webcam AI perception — PROTO-001)
+## Put it on the internet
 
-Start the backend directly in live mode (simulator off, only the PROTO-001
-prototype node is shown):
+Free options, no card drama — permanent server or an instant tunnel URL:
 
 ```bash
-cd control_centre/backend
-venv/bin/python server.py --start-mode live     # REST :5001 + WS :8765
+# A) Real server (permanent URL): needs a free VPS + SSH access
+sudo ./deploy/provision.sh ubuntu@<server-ip>
+
+# B) Instant demo URL from this machine (no server, no account)
+FLEETIQ_ADMIN_PASSWORD='<strong-password>' ./deploy/tunnel-demo.sh
 ```
 
-Then in the UI switch **DATA SOURCE → ● LIVE PROTOTYPE** (or start with
-`--start-mode live`). On the **Live Fleet** page (or `/fleet/PROTO-001`):
+Details, trade-offs and judge-demo checklist: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
-1. Assign the webcam to a perception system — **Driver DDS / Pothole / Cabin**
-   (one webcam, one module at a time).
-2. In the driver camera feed, press **⚙ Calibrate** — 5 s personal baseline
-   (EAR/MAR thresholds are computed from your real face).
-3. Press **▶ Start Monitoring** — the original DDS engine runs on the live
-   camera: real EAR/MAR/head pose/eye closure/PERCLOS/driver state, the
-   original DDS audio warning on drowsiness, and `DRIVER_DROWSINESS` /
-   `DRIVER_ALERT` events land in the existing event feed with
-   `bus_id: PROTO-001`, `data_source: live`.
+## API
 
-`GET /api/dds/status` and `POST /api/dds/calibrate|start|stop|reset` drive
-this flow; see `control_centre/README.md`.
+30+ endpoints under `/api/*` plus two WebSocket channels. Overview and the
+auth model: [docs/API.md](docs/API.md).
 
-## Development Notes
+## Testing
 
-- These are **development/calibration observations, NOT validated thresholds**:
-  EAR ≈ 0.300 (one calibration), EAR threshold explored ≈ 0.23,
-  MAR ≈ 0.400 (one calibration), head pitch ≈ 3.6°, prolonged eye closure ≈ 1.3 s.
-  No accuracy/precision/F1/FPS/dataset claims are made unless measured.
-- Simulation data is always labeled as `[SIMULATION]`; it is never presented as real measurement.
+```bash
+cd control_centre/backend && venv/bin/python -m pytest -q   # 800+ tests, isolated per-test DBs
+cd control_centre/frontend && npm test && npm run build
+```
+
+CI runs both on every push and pull request.
+
+## Security
+
+Production mode (`FLEETIQ_ENV=production`) requires authentication for reads,
+refuses default passwords at startup, and gates every privileged action
+backend-side (the frontend role is display-only). See [SECURITY.md](SECURITY.md).
+
+## Contributing
+
+Issues and pull requests are welcome — start with [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+[MIT](LICENSE) — free for anyone to use, including judges and evaluators.
+
+## Acknowledgements
+
+- Chennai MTC network data (GTFS) for routes and stops
+- [D-Fire dataset](https://github.com/rabahdev) for the cabin fire/smoke model
+- [Ultralytics YOLOv8](https://github.com/ultralytics/ultralytics) for detection backbones
+- [MediaPipe](https://developers.google.com/mediapipe) for driver face mesh

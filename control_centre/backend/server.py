@@ -664,7 +664,7 @@ def _auto_start_dds():
 def _start_traffic_monitor():
     """Feed live bus positions to the traffic heat-map engine on a fixed cadence.
 
-    A hotspot appears when 5+ buses stay within a 150 m radius for over a minute
+    A hotspot appears when 8+ buses sit inside a 50 m circle for over a minute
     (see traffic_engine). Runs in every mode; it only reacts to whatever bus
     telemetry the store actually holds."""
     def _runner():
