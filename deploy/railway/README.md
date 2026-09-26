@@ -12,7 +12,9 @@
 #     exist on amd64; runtime imports are lazy so only flask/flask-cors/
 #     websockets are actually loaded in simulation — memory stays small).
 #     Start: python server.py --host :: --port $PORT --ws-port 8765 --start-mode simulation
-#     Env: FLEETIQ_ENV=production
+#     Env: PORT=5001 (pinned — Railway injects 10000 by default, but the
+#          gateway proxies the familiar backend:5001/8765/8766)
+#          FLEETIQ_ENV=production
 #          FLEETIQ_SAME_ORIGIN=1
 #          FLEETIQ_ADMIN_USER=sih
 #          FLEETIQ_ADMIN_PASSWORD=<set in dashboard, never committed>

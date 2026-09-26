@@ -16,6 +16,10 @@ export default defineRailway(() => {
     healthcheck: "/api/health",
     replicas: { sfo: 1 },
     env: {
+      // Railway injects PORT=10000 into every service, but our three
+      // listeners use fixed ports and the gateway proxies backend:5001 —
+      // so pin PORT (overridable per the docs) instead of rewiring.
+      PORT: "5001",
       FLEETIQ_ENV: "production",
       FLEETIQ_SAME_ORIGIN: "1",
       FLEETIQ_ADMIN_USER: "sih",
