@@ -99,12 +99,15 @@ class MTCTransitProvider:
 
         log.info("Found %d trips for MTC routes", len(self._mtc_trips))
 
-        # Collect stop_ids used by MTC trips
+        # Collect stop_ids used by MTC trips (walk the by-trip index — there is
+        # no flat stop_times list anymore).
         mtc_trip_ids = {t["trip_id"] for t in self._mtc_trips}
 
-        for st in self._loader.stop_times:
-            if st.get("trip_id") in mtc_trip_ids:
-                stop_id = st.get("stop_id", "")
+        for trip_id, rows in self._loader._stop_times_by_trip.items():
+            if trip_id not in mtc_trip_ids:
+                continue
+            for st in rows:
+                stop_id = st[GTFSLoader.ST_STOP]
                 if stop_id not in self._mtc_stops:
                     stop = self._loader.get_stop(stop_id)
                     if stop:
@@ -146,7 +149,7 @@ class MTCTransitProvider:
             stop_times = self._loader.get_stop_times_for_trip(best_trip["trip_id"])
             route_stops = []
             for st in stop_times:
-                stop_id = st.get("stop_id", "")
+                stop_id = st[GTFSLoader.ST_STOP]
                 stop = self._mtc_stops.get(stop_id) or self._loader.get_stop(stop_id)
                 if stop:
                     try:
@@ -155,11 +158,11 @@ class MTCTransitProvider:
                             "stop_name": stop.get("stop_name", ""),
                             "lat": float(stop.get("stop_lat", 0)),
                             "lon": float(stop.get("stop_lon", 0)),
-                            "sequence": int(st.get("stop_sequence", 0)),
-                            "arrival_time": st.get("arrival_time", ""),
-                            "departure_time": st.get("departure_time", ""),
+                            "sequence": int(st[GTFSLoader.ST_SEQ]),
+                            "arrival_time": st[GTFSLoader.ST_ARR],
+                            "departure_time": st[GTFSLoader.ST_DEP],
                         })
-                    except (ValueError, KeyError):
+                    except (ValueError, KeyError, IndexError):
                         continue
 
             route_stops.sort(key=lambda s: s["sequence"])
@@ -193,8 +196,9 @@ class MTCTransitProvider:
         return self._mtc_trips
 
     def get_stop_times(self):
-        """Return all stop_times for MTC trips."""
-        return self._loader.stop_times
+        """Return all stop_times for MTC trips (always [] — bulk timetable is
+        released after init; route stops live in get_route_stops)."""
+        return []
 
     def get_route_stops(self, route_id: str):
         """Return ordered list of stops for a route."""

@@ -178,3 +178,17 @@ def test_dds_session_event_persisted():
     got = store.get_events(100)[0]
     assert got["event_type"] == "DDS_SESSION_END"
     assert "drowsy=3" in got["details"]
+
+def test_event_store_is_capped_but_persistence_keeps_everything():
+    """Memory holds a window (MAX_EVENTS); SQLite keeps the full history."""
+    from data_store import EventStore
+    n = EventStore.MAX_EVENTS + 200
+    for i in range(n):
+        store.add_event(_mk_event(details=f"cap-probe-{i:05d}"))
+    assert len(store.events) == EventStore.MAX_EVENTS
+    # newest retained, oldest evicted
+    newest = store.get_events(1)[0]
+    assert newest["details"] == f"cap-probe-{n-1:05d}"
+    assert all("cap-probe-00000" != e["details"] for e in store.get_events(5000))
+    # ...while persistence still has every row
+    assert len(persistence.load_events()) == n

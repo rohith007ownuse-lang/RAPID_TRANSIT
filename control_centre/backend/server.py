@@ -805,17 +805,24 @@ def main():
     except ImportError:
         print("[control-centre] data_source_manager module not available.")
 
-    # Initialize GTFS shape interpolator
+    # Initialize GTFS shape interpolator — REUSES the simulator's already-loaded
+    # tables through the shared MTC provider. A second GTFSLoader().load()
+    # here once duplicated the 1.36M-row timetable (~640MB) and pushed total
+    # RSS past 1.4GB; one shared copy plus release_bulk() keeps it ~250MB.
+    # NOTE: read simulator.mtc_provider at USE time — `from simulator import
+    # mtc_provider` would bind the pre-load None forever.
     try:
-        from gtfs_shape_interpolator import route_shape_manager
-        from gtfs_loader import GTFSLoader
-        from pathlib import Path
-        gtfs_path = str(Path(__file__).parent / "data" / "mtc-gtfs.zip")
-        if Path(gtfs_path).exists():
-            gtfs = GTFSLoader(gtfs_path)
-            gtfs.load()
-            route_shape_manager.initialize_from_gtfs(gtfs)
-            print("[control-centre] GTFS shape interpolator initialized.")
+        import simulator as _sim_mod
+        _sim_mod._ensure_gtfs_loaded()
+        _provider = _sim_mod.mtc_provider
+        _loader = _provider._loader if _provider is not None else None
+        if _loader is not None and _loader._loaded:
+            from gtfs_shape_interpolator import route_shape_manager
+            route_shape_manager.initialize_from_gtfs(_loader)
+            _loader.release_bulk()
+            print("[control-centre] GTFS shape interpolator initialized (shared tables).")
+        else:
+            print("[control-centre] GTFS unavailable — route map uses stop-to-stop lines.")
     except Exception as e:
         print(f"[control-centre] GTFS shape interpolator init failed: {e}")
 

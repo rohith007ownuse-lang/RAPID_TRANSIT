@@ -104,6 +104,12 @@ class ModeState:
 class EventStore:
     """Thread-safe containers for buses, events, and road defects."""
 
+    # In-memory event cap. Reads only ever serve the newest 500–1000, and
+    # persistence (SQLite) keeps the full history — so the live dict holds a
+    # generous window, not an unbounded month of simulation. Without this, a
+    # 24/7 deployment grows without limit.
+    MAX_EVENTS = 5000
+
     def __init__(self):
         self._lock = threading.Lock()
 
@@ -152,6 +158,7 @@ class EventStore:
             for event in events:
                 event_id = event.get("event_id") or str(uuid.uuid4())[:13]
                 self.events[event_id] = dict(event)
+            self._trim_locked()
 
     def add_event(self, event):
         """Add an event to the store.
@@ -167,6 +174,7 @@ class EventStore:
         event.setdefault("status", "ACTIVE")
         with self._lock:
             self.events[event_id] = event
+            self._trim_locked()
         # Phase 16: correlate the raw event into an operational INCIDENT so
         # the Incident Management workflow (Not finished / Resolved / Total)
         # reflects what actually happens — previously incidents were only
@@ -201,6 +209,16 @@ class EventStore:
         with self._lock:
             items = list(self.events.values())
         return items[-limit:][::-1]
+
+    def _trim_locked(self):
+        """Drop oldest events beyond MAX_EVENTS. Callers must hold the lock.
+
+        OrderedDict preserves insertion order, so the head is always the
+        oldest. Persistence keeps the full history — this only bounds RAM.
+        """
+        overflow = len(self.events) - self.MAX_EVENTS
+        for _ in range(max(0, overflow)):
+            self.events.popitem(last=False)
 
     def acknowledge_event(self, event_id, operator=None):
         with self._lock:

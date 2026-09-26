@@ -26,10 +26,24 @@ log = logging.getLogger(__name__)
 
 
 class GTFSLoader:
-    """Parse a GTFS zip file and expose its contents as Python dicts/lists."""
+    """Parse a GTFS zip file and expose its contents as Python dicts/lists.
+
+    Memory contract: stop_times.txt holds 1.36M rows. Rows are NEVER kept as
+    dicts and NEVER kept in a flat list — they stream straight into compact
+    per-trip tuples ``(stop_id, stop_sequence, arrival_time, departure_time)``.
+    The flat list + dict rows once cost ~640MB and OOM-killed small cloud
+    boxes; the tuple index costs ~130MB transient and is released after init
+    via release_bulk().
+    """
 
     REQUIRED_FILES = {"agency.txt", "routes.txt", "stops.txt", "trips.txt", "stop_times.txt"}
     OPTIONAL_FILES = {"calendar.txt", "calendar_dates.txt", "shapes.txt", "feed_info.txt"}
+
+    # Positions inside a stop-time tuple (trip_id is the dict key).
+    ST_STOP = 0
+    ST_SEQ = 1
+    ST_ARR = 2
+    ST_DEP = 3
 
     def __init__(self, zip_path: str):
         self.zip_path = Path(zip_path)
@@ -37,7 +51,6 @@ class GTFSLoader:
         self.routes = []            # list of dicts
         self.stops = []             # list of dicts
         self.trips = []             # list of dicts
-        self.stop_times = []        # list of dicts
         self.shapes = {}            # shape_id -> list of {shape_pt_lat, shape_pt_lon, shape_pt_sequence}
         self.calendar = []          # list of dicts
         self.feed_info = {}
@@ -47,8 +60,9 @@ class GTFSLoader:
         self._stops_by_id = {}      # stop_id -> stop dict
         self._trips_by_id = {}      # trip_id -> trip dict
         self._trips_by_route = defaultdict(list)   # route_id -> [trip dicts]
-        self._stop_times_by_trip = defaultdict(list)  # trip_id -> [stop_time dicts, sorted]
+        self._stop_times_by_trip = defaultdict(list)  # trip_id -> [(stop, seq, arr, dep)], sorted
         self._routes_by_agency = defaultdict(list)  # agency_id -> [route dicts]
+        self._stop_times_count = 0
 
         self._loaded = False
 
@@ -75,7 +89,7 @@ class GTFSLoader:
             self.routes = self._read_csv(zf, "routes.txt")
             self.stops = self._read_csv(zf, "stops.txt")
             self.trips = self._read_csv(zf, "trips.txt")
-            self.stop_times = self._read_csv(zf, "stop_times.txt")
+            self._load_stop_times(zf)
 
             if "calendar.txt" in available:
                 self.calendar = self._read_csv(zf, "calendar.txt")
@@ -92,7 +106,7 @@ class GTFSLoader:
         log.info(
             "GTFS loaded: %d agencies, %d routes, %d stops, %d trips, %d stop_times",
             len(self.agencies), len(self.routes), len(self.stops),
-            len(self.trips), len(self.stop_times),
+            len(self.trips), self._stop_times_count,
         )
 
     # ------------------------------------------------------------------
@@ -112,6 +126,11 @@ class GTFSLoader:
         return self._trips_by_route.get(route_id, [])
 
     def get_stop_times_for_trip(self, trip_id: str):
+        """Stop-time tuples for a trip, sorted by sequence.
+
+        Each tuple is (stop_id, stop_sequence, arrival_time, departure_time)
+        — see ST_STOP/ST_SEQ/ST_ARR/ST_DEP. Empty after release_bulk().
+        """
         return self._stop_times_by_trip.get(trip_id, [])
 
     def get_routes_for_agency(self, agency_id: str):
@@ -131,6 +150,35 @@ class GTFSLoader:
             text = io.TextIOWrapper(f, encoding="utf-8-sig")
             reader = csv.DictReader(text)
             return [row for row in reader]
+
+    def _load_stop_times(self, zf: zipfile.ZipFile):
+        """Stream stop_times rows straight into per-trip tuples.
+
+        Never builds dicts or a flat list: 1.36M rows as dicts cost ~640MB,
+        as compact tuples ~130MB transient (released after init anyway).
+        A malformed sequence sorts last rather than killing the load.
+        """
+        with zf.open("stop_times.txt") as f:
+            text = io.TextIOWrapper(f, encoding="utf-8-sig")
+            reader = csv.DictReader(text)
+            by_trip = self._stop_times_by_trip
+            count = 0
+            for row in reader:
+                try:
+                    seq = int(row.get("stop_sequence", 0) or 0)
+                except (ValueError, TypeError):
+                    seq = 0
+                by_trip[row.get("trip_id", "")].append((
+                    row.get("stop_id", ""),
+                    seq,
+                    row.get("arrival_time", ""),
+                    row.get("departure_time", ""),
+                ))
+                count += 1
+        for rows in by_trip.values():
+            rows.sort(key=lambda r: r[self.ST_SEQ])
+        self._stop_times_count = count
+        log.info("Loaded %d stop_times rows into per-trip tuples", count)
 
     def _load_shapes(self, zf: zipfile.ZipFile):
         """Load shapes.txt into a dict keyed by shape_id."""
@@ -169,12 +217,6 @@ class GTFSLoader:
             self._trips_by_id[tid] = trip
             self._trips_by_route[trip.get("route_id", "")].append(trip)
 
-        # Stop times must be sorted by trip_id + stop_sequence for efficient access
-        self.stop_times.sort(key=lambda st: (st.get("trip_id", ""), int(st.get("stop_sequence", 0))))
-
-        for st in self.stop_times:
-            self._stop_times_by_trip[st.get("trip_id", "")].append(st)
-
     def stats(self):
         """Return a summary dict of the loaded GTFS data."""
         return {
@@ -182,6 +224,17 @@ class GTFSLoader:
             "routes": len(self.routes),
             "stops": len(self.stops),
             "trips": len(self.trips),
-            "stop_times": len(self.stop_times),
+            "stop_times": self._stop_times_count,
             "shapes": len(self.shapes),
         }
+
+    def release_bulk(self):
+        """Free the per-row timetable after init is done.
+
+        Everything the app serves is precomputed during init (provider route
+        stops, shape-manager route stops); nothing reads these tables at
+        request time. Afterwards get_stop_times_for_trip() returns [] instead
+        of crashing, and stats() still reports the loaded row count.
+        """
+        self._stop_times_by_trip = {}
+        log.info("GTFS bulk timetable released from memory")

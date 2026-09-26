@@ -20,6 +20,8 @@ import threading
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 
+from gtfs_loader import GTFSLoader
+
 
 class ShapeInterpolator:
     """
@@ -275,7 +277,7 @@ class RouteShapeManager:
                     stop_times = gtfs_loader.get_stop_times_for_trip(trip_id)
                     route_stops = []
                     for st in stop_times:
-                        stop_id = st.get("stop_id", "")
+                        stop_id = st[GTFSLoader.ST_STOP]
                         stop = gtfs_loader.get_stop(stop_id)
                         if stop:
                             route_stops.append({
@@ -283,7 +285,7 @@ class RouteShapeManager:
                                 "stop_name": stop.get("stop_name", ""),
                                 "lat": float(stop.get("stop_lat", 0)),
                                 "lon": float(stop.get("stop_lon", 0)),
-                                "sequence": int(st.get("stop_sequence", 0)),
+                                "sequence": int(st[GTFSLoader.ST_SEQ]),
                             })
                     self._route_stops[route_code] = sorted(route_stops, key=lambda s: s["sequence"])
 
