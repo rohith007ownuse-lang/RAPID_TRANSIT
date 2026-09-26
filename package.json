@@ -1,0 +1,26 @@
+{
+  "name": "rapid-tracker",
+  "version": "1.0.0",
+  "description": "[![CI](https://github.com/rohith007ownuse-lang/fleet-iq/actions/workflows/ci.yml/badge.svg)](https://github.com/rohith007ownuse-lang/fleet-iq/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](control_centre/backend/requirements.txt) [![Node 20+](https://img.shields.io/badge/node-20%2B-green.svg)](control_centre/frontend/package.json)",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rohith007ownuse-lang/fleet-iq.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/rohith007ownuse-lang/fleet-iq/issues"
+  },
+  "homepage": "https://github.com/rohith007ownuse-lang/fleet-iq#readme",
+  "dependencies": {
+    "railway": "^3.11.0"
+  }
+}
