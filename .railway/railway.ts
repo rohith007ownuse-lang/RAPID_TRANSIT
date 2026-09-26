@@ -1,4 +1,4 @@
-import { defineRailway, github, project, service } from "railway/iac";
+import { defineRailway, github, preserve, project, service } from "railway/iac";
 
 // FLEET-IQ on Railway: a private backend plus a public nginx gateway.
 // One public URL (the gateway); the browser, the API and both sockets share
@@ -23,6 +23,9 @@ export default defineRailway(() => {
       FLEETIQ_ENV: "production",
       FLEETIQ_SAME_ORIGIN: "1",
       FLEETIQ_ADMIN_USER: "sih",
+      // Set once via CLI; preserve() keeps Railway's value. Deleting it
+      // would break future bootstraps (production refuses default passwords).
+      FLEETIQ_ADMIN_PASSWORD: preserve(),
       FLEETIQ_DRIVER_CAMERA_DEVICE: "none",
       FLEETIQ_CABIN_CAMERA_DEVICE: "none",
       FLEETIQ_ROAD_CAMERA_DEVICE: "none",
