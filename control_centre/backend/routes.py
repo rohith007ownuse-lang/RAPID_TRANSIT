@@ -1422,15 +1422,25 @@ def toggle_feature(key):
 
 @api.route("/api/test-audio", methods=["POST"])
 def test_audio():
-    """Test audio playback. Plays a warning tone for 2 seconds."""
+    """Test audio playback. Plays a warning tone for 2 seconds.
+
+    Gated by audio_alerts: refuses to play while the toggle is OFF so
+    startup stays silent. Enable Audio Alerts in Feature Toggles first.
+    """
     import sys
     import os
     import threading
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
     try:
+        from feature_toggles import feature_toggles
+        if not feature_toggles.get("audio_alerts"):
+            return jsonify({
+                "ok": False,
+                "error": "Audio Alerts is OFF. Enable it in Feature Toggles first.",
+            }), 409
         from bus_node.utils.alert_manager import AlertManager
-        # Unmute
-        AlertManager.muted = False
+        # Sync with toggle (do NOT force-unmute)
+        AlertManager.muted = not feature_toggles.get("audio_alerts")
         am = AlertManager()
         am.update("WARNING")
         def stop_test():

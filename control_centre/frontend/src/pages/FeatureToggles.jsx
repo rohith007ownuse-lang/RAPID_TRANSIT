@@ -23,7 +23,7 @@ const DEFAULT_FEATURES = {
 
   // Safety Features
   auto_braking: { enabled: false, label: 'Automatic Braking', icon: '🛑', category: 'Safety Features', desc: 'DISABLED - Brake recommendation only' },
-  audio_alerts: { enabled: true, label: 'Audio Alerts', icon: '🔊', category: 'Safety Features', desc: 'Sound warnings for drowsiness detection' },
+  audio_alerts: { enabled: false, label: 'Audio Alerts', icon: '🔊', category: 'Safety Features', desc: 'Sound warnings for drowsiness detection (OFF at start)' },
   crash_detection: { enabled: true, label: 'Crash Detection', icon: '💥', category: 'Safety Features', desc: 'IMU-based impact detection (simulated)' },
   overload_alert: { enabled: true, label: 'Overload Alert', icon: '⚠️', category: 'Safety Features', desc: 'Passenger overload warning' },
 

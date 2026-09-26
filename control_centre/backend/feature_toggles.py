@@ -34,9 +34,10 @@ DEFAULT_TOGGLES = {
     "arduino_control": True,
     "serial_comm": True,
 
-    # Safety Features
+    # Safety Features — audio_alerts defaults OFF: silent at startup,
+    # sound only after the operator enables it in Feature Toggles.
     "auto_braking": True,
-    "audio_alerts": True,  # ON: DDS 2.3 s eye-closure / face-lost CRITICAL alarm sounds
+    "audio_alerts": False,  # OFF at start: DDS alarm sounds only when toggled ON
     "crash_detection": True,
     "overload_alert": True,
 
@@ -87,9 +88,16 @@ class FeatureToggleManager:
                 self._toggles = dict(DEFAULT_TOGGLES)
                 self._save()
                 print(f"[feature_toggles] Created default toggles ({len(self._toggles)} features)")
+            # Silent-start rule: sound alerts are ALWAYS off at boot.
+            # Operator must explicitly enable audio_alerts in Feature Toggles.
+            if self._toggles.get("audio_alerts"):
+                self._toggles["audio_alerts"] = False
+                self._save()
+                print("[feature_toggles] audio_alerts forced OFF at startup (silent start)")
         except Exception as e:
             print(f"[feature_toggles] Error loading toggles: {e}")
             self._toggles = dict(DEFAULT_TOGGLES)
+            self._toggles["audio_alerts"] = False
 
     def _save(self):
         """Save toggles to file."""
@@ -159,9 +167,19 @@ class FeatureToggleManager:
                     from ai.driver.driver_drowsiness import driver_detector
                     if driver_detector._audio is not None:
                         driver_detector._audio.muted = AlertManager.muted
+                        if not enabled:
+                            driver_detector._audio.stop()
                         print(f"[feature_toggles] Updated DDS AlertManager instance muted={AlertManager.muted}")
                 except Exception:
                     pass
+                # When disabling: immediately silence any looping alarm
+                if not enabled:
+                    try:
+                        from bus_node.utils.alert_manager import _kill_all_stray_loops
+                        AlertManager().stop()
+                        _kill_all_stray_loops()
+                    except Exception:
+                        pass
                 # Play a test sound if enabling
                 if enabled:
                     try:

@@ -3,8 +3,26 @@ import { useNavigate } from 'react-router-dom'
 import { api } from '../api.js'
 import { useAuth } from '../lib/authContext.jsx'
 
-/* Distinct escalation sound: soft two-tone chirp (660 Hz -> 880 Hz sine),
-   deliberately different from the harsh driver-drowsiness alarm loop. */
+/* Sound gate: OFF at startup, only plays when audio_alerts is ON in
+   Feature Toggles. Checks backend first, falls back to localStorage. */
+let _audioCache = { value: false, ts: 0 }
+async function isAudioEnabled() {
+  const now = Date.now()
+  if (now - _audioCache.ts < 5000) return _audioCache.value
+  try {
+    const data = await api.getFeatures()
+    _audioCache = { value: !!data?.audio_alerts, ts: now }
+    return _audioCache.value
+  } catch { /* fall through to localStorage */ }
+  try {
+    const saved = JSON.parse(localStorage.getItem('rapid_feature_toggles') || '{}')
+    // localStorage stores full objects {enabled} or plain booleans
+    const v = saved?.audio_alerts
+    const enabled = typeof v === 'object' ? !!v.enabled : !!v
+    _audioCache = { value: enabled, ts: now }
+    return enabled
+  } catch { return false }
+}
 function playEscalationSound(escalationLevel = 0) {
   try {
     const Ctx = window.AudioContext || window.webkitAudioContext
@@ -44,6 +62,8 @@ export default function CriticalIncidentPopup() {
   const [items, setItems] = useState([])
   const [dismissed, setDismissed] = useState({})
   const seenRef = useRef({}) // incident_id -> escalation_level already sounded
+  const dismissedRef = useRef({})
+  dismissedRef.current = dismissed
 
   useEffect(() => {
     let alive = true
@@ -60,7 +80,8 @@ export default function CriticalIncidentPopup() {
           const lvl = inc.escalation_level || 0
           if ((seenRef.current[key] ?? -1) < lvl) {
             seenRef.current[key] = lvl
-            if (!dismissed[key]) playEscalationSound(lvl)
+            // Sound only if audio_alerts toggle is ON — silent otherwise
+            if (!dismissedRef.current[key] && (await isAudioEnabled())) playEscalationSound(lvl)
           }
         }
       } catch (e) { /* ignore polling errors */ }
