@@ -4,7 +4,24 @@ Two supported ways to put the control centre on the internet. Both serve the
 SPA, the REST API, and both WebSockets on **one origin**, so judges open a
 single URL and everything works.
 
-## Option A — real server (permanent URL, recommended for judging)
+## Option A — Railway trial (real server, no card, temporary)
+
+$5 of credit for 30 days, no credit card — enough for a judging window, not
+forever. After the credit runs out the services stop (Hobby needs a credit
+card). The layout is two services in `deploy/railway/` and `.railway/`:
+
+- `backend` (private): the Python app, root directory
+  `control_centre/backend`, bound to `::` for Railway's private IPv6 network.
+  `PORT` is pinned to 5001 (Railway injects 10000 by default).
+- `gateway` (public): nginx serving the built SPA and proxying `/api`, `/ws`,
+  `/ws/camera` to the backend. Owns the public `*.up.railway.app` URL.
+
+The whole layout is managed as code (`.railway/railway.ts`): `railway config
+plan` / `railway config apply`. The admin password is set via CLI, never in
+git. The SQLite database is ephemeral — redeploys wipe users/incidents, the
+admin bootstraps back from env, the simulator regenerates the fleet.
+
+## Option B — real server (permanent URL, recommended for judging)
 
 Any Ubuntu 22.04+ box with SSH. Free tier that fits: Oracle Cloud Always Free
 (ARM) or GCP e2-micro.
@@ -44,7 +61,7 @@ Without a domain the site works on `http://<server-ip>/`. The backend runs in
 **simulation mode**: cameras/ML stay on your local machine (a cloud box has no
 cameras), and every page shows its `SIMULATION` badge.
 
-## Option B — instant tunnel URL (no server, no account)
+## Option C — instant tunnel URL (no server, no account)
 
 ```bash
 FLEETIQ_ADMIN_PASSWORD='<strong-password>' ./deploy/tunnel-demo.sh
