@@ -1,6 +1,0 @@
-# Railway gateway service (repo root; the root Dockerfile is auto-detected).
-# The backend service uses control_centre/backend/railway.toml instead —
-# each service only reads the railway.toml in its own root directory.
-[deploy]
-healthcheckPath = "/api/health"
-restartPolicyType = "ON_FAILURE"

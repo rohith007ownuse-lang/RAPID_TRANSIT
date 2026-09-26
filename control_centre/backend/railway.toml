@@ -1,8 +1,0 @@
-# Railway backend service (root directory: control_centre/backend).
-[build]
-builder = "NIXPACKS"
-
-[deploy]
-startCommand = "python server.py --host :: --port $PORT --ws-port 8765 --start-mode simulation"
-healthcheckPath = "/api/health"
-restartPolicyType = "ON_FAILURE"
