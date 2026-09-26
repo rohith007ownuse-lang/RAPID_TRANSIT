@@ -1,7 +1,8 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../lib/authContext.jsx'
 import { BrandLogo } from '../components/UI.jsx'
+import { api } from '../api.js'
 
 export default function Login() {
   const { login } = useAuth()
@@ -10,6 +11,22 @@ export default function Login() {
   const [password, setPassword] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  // Railway demo link: pre-filled + visible password so visitors just press Enter.
+  // Only true when the backend serves demo credentials (FLEETIQ_DEMO_AUTOFILL=1).
+  const [demoMode, setDemoMode] = useState(false)
+
+  useEffect(() => {
+    let alive = true
+    api.demoCredentials()
+      .then((d) => {
+        if (!alive || !d?.enabled) return
+        setUsername(d.username || '')
+        setPassword(d.password || '')
+        setDemoMode(true)
+      })
+      .catch(() => { /* demo autofill off — normal empty login form */ })
+    return () => { alive = false }
+  }, [])
 
   async function submit(e) {
     e.preventDefault()
@@ -55,12 +72,18 @@ export default function Login() {
           <input
             id="password"
             className="input"
-            type="password"
+            type={demoMode ? 'text' : 'password'}
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             autoComplete="current-password"
             required
           />
+
+          {demoMode && (
+            <div className="muted" style={{ fontSize: 12, textAlign: 'center' }}>
+              Demo link — credentials filled in, just press <strong>Sign In</strong> ↵
+            </div>
+          )}
 
           {error && <div className="login-error">{error}</div>}
 

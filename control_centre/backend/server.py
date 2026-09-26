@@ -48,9 +48,10 @@ else:
 app.config["JSON_SORT_KEYS"] = False
 
 # Endpoints that stay reachable without a token even when authenticated reads
-# are enforced: the health probe (uptime/load balancers) and the login call
-# that mints the first token.
-_PUBLIC_API_PATHS = frozenset({"/api/health", "/api/auth/login"})
+# are enforced: the health probe (uptime/load balancers), the login call
+# that mints the first token, and the Railway demo autofill helper (which
+# 404s unless FLEETIQ_DEMO_AUTOFILL=1).
+_PUBLIC_API_PATHS = frozenset({"/api/health", "/api/auth/login", "/api/auth/demo-credentials"})
 
 
 @app.before_request

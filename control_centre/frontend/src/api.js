@@ -54,6 +54,7 @@ async function postJson(path, body, tokenOpt) {
 export const api = {
   // ---- Authentication (Phase 5) ----
   login: (body) => postJson('/auth/login', body, null),
+  demoCredentials: () => get('/auth/demo-credentials', null),
   me: (tokenOpt) => get('/auth/me', tokenOpt),
   logout: (tokenOpt) => postJson('/auth/logout', {}, tokenOpt),
   changeOwnPassword: (body) => postJson('/auth/me/password', body),

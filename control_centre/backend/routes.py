@@ -204,6 +204,24 @@ def auth_access():
     })
 
 
+@api.route("/api/auth/demo-credentials", methods=["GET"])
+def auth_demo_credentials():
+    """Railway demo link helper: pre-fill login so visitors just press Enter.
+
+    ONLY active when FLEETIQ_DEMO_AUTOFILL=1 (set on the Railway backend
+    service, never locally). Otherwise 404 — no credentials are exposed.
+    Anyone with the link can read these, by design for judge demos.
+    """
+    import os
+    if os.environ.get("FLEETIQ_DEMO_AUTOFILL", "0").strip() != "1":
+        return jsonify({"error": "not found"}), 404
+    return jsonify({
+        "enabled": True,
+        "username": os.environ.get("FLEETIQ_ADMIN_USER", "admin").strip() or "admin",
+        "password": os.environ.get("FLEETIQ_ADMIN_PASSWORD", "admin123"),
+    })
+
+
 @api.route("/api/auth/me", methods=["GET"])
 @_require_auth()
 def auth_me():

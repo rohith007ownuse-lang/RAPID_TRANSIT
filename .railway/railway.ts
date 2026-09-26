@@ -23,6 +23,10 @@ export default defineRailway(() => {
       FLEETIQ_ENV: "production",
       FLEETIQ_SAME_ORIGIN: "1",
       FLEETIQ_ADMIN_USER: "sih",
+      // Demo link: pre-fill login (visible password) so visitors just press Enter.
+      // The /api/auth/demo-credentials endpoint 404s unless this is "1".
+      // Never set this on a private/internal deployment.
+      FLEETIQ_DEMO_AUTOFILL: "1",
       // Set once via CLI; preserve() keeps Railway's value. Deleting it
       // would break future bootstraps (production refuses default passwords).
       FLEETIQ_ADMIN_PASSWORD: preserve(),
